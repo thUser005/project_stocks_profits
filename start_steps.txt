@@ -11,3 +11,6 @@ sh server_control.sh restart
 sh server_control.sh status
 
 chmod +x server_control.sh
+
+python3.10 -m pip install -r requirements.txt
+
