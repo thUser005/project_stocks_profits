@@ -1,0 +1,13 @@
+# Start background stock tracker
+sh server_control.sh start
+
+# Stop it
+sh server_control.sh stop
+
+# Restart it
+sh server_control.sh restart
+
+# Check if running
+sh server_control.sh status
+
+chmod +x server_control.sh
