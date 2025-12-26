@@ -4,9 +4,10 @@ import os
 from pymongo import MongoClient
 from datetime import datetime, timezone
 
-
-is_replaced = False 
-
+# ============================
+# FLAGS
+# ============================
+is_replaced = True
 
 # ============================
 # NSE CONFIG
@@ -85,18 +86,34 @@ def calculate_trade(open_p, high_p, low_p):
     }
 
 # ============================
-# MONGODB CONNECTION
-# ============================
-client = MongoClient(MONGO_URL)
-db = client[DB_NAME]
-collection = db[COLLECTION_NAME]
-
-# ============================
 # NSE SESSION
 # ============================
 session = requests.Session()
 session.headers.update(HEADERS)
 session.get("https://www.nseindia.com", timeout=10)
+
+# ============================
+# FETCH F&O SYMBOLS
+# ============================
+def get_fo_symbols():
+    url = "https://www.nseindia.com/api/equity-stockIndices"
+    params = {"index": "SECURITIES IN F&O"}
+
+    res = session.get(url, params=params, timeout=10)
+    res.raise_for_status()
+
+    data = res.json()
+    return {item["symbol"] for item in data.get("data", [])}
+
+FO_SYMBOLS = get_fo_symbols()
+print(f"✅ Loaded {len(FO_SYMBOLS)} F&O symbols")
+
+# ============================
+# MONGODB CONNECTION
+# ============================
+client = MongoClient(MONGO_URL)
+db = client[DB_NAME]
+collection = db[COLLECTION_NAME]
 
 # ============================
 # FETCH + PROCESS DATA
@@ -105,6 +122,10 @@ final_output = {
     "gainers": [],
     "loosers": []
 }
+
+# 🔢 COUNTERS
+total_stocks = 0
+option_stocks = 0
 
 for index_type in ["gainers", "loosers"]:
     print(f"📡 Fetching {index_type.upper()}")
@@ -125,6 +146,16 @@ for index_type in ["gainers", "loosers"]:
             continue
 
         for stock in index_data.get("data", []):
+            total_stocks += 1
+
+            symbol = stock.get("symbol")
+
+            # 🔴 FILTER: ONLY OPTION-AVAILABLE STOCKS
+            if symbol not in FO_SYMBOLS:
+                continue
+
+            option_stocks += 1
+
             open_p = stock.get("open_price")
             high_p = stock.get("high_price")
             low_p = stock.get("low_price")
@@ -134,8 +165,9 @@ for index_type in ["gainers", "loosers"]:
 
             final_output[index_type].append({
                 "index": index_name,
-                "symbol": stock.get("symbol"),
+                "symbol": symbol,
                 "series": stock.get("series"),
+                "is_option_available": True,
                 "open_price": open_p,
                 "high_price": high_p,
                 "low_price": low_p,
@@ -145,12 +177,18 @@ for index_type in ["gainers", "loosers"]:
             })
 
 # ============================
-# SAVE TO MONGODB (WITH FLAG)
+# PRINT SUMMARY
+# ============================
+percentage = (option_stocks / total_stocks * 100) if total_stocks else 0
+print(f"📊 Option-eligible stocks loaded: {option_stocks} / {total_stocks} ({percentage:.2f}%)")
+
+# ============================
+# SAVE TO MONGODB
 # ============================
 today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 existing_doc = collection.find_one({"date": today})
-
+is_replaced = True if existing_doc else False
 
 document = {
     "date": today,
@@ -169,5 +207,4 @@ collection.update_one(
     upsert=True
 )
 
-
-print(f"✅ NSE data saved | replaced={is_replaced}")
+print(f"✅ ONLY OPTION STOCKS SAVED | replaced={is_replaced}")
