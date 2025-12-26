@@ -1,66 +1,41 @@
+import requests
 import json
-import time
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait, Select
-from selenium.webdriver.support import expected_conditions as EC
 
-# =====================================
-# CONFIG
-# =====================================
-CHROMEDRIVER_PATH = r"chromedriver"
-URL = "https://www.nseindia.com/market-data/top-gainers-losers"
-OUTPUT_FILE = "nse_top_gainers_losers.json"
+# ============================
+# NSE CONFIG
+# ============================
+URL = "https://www.nseindia.com/api/live-analysis-variations"
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/121.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/",
+    "Connection": "keep-alive"
+}
+
+# ============================
 # TRADE CONFIG
-CAPITAL = 10000
+# ============================
+CAPITAL = 50000
 RISK_PERCENT = 1
 ENTRY_RANGE_PERCENT = 0.55
 SL_PERCENT = 1.35
 
-# =====================================
-# CHROME OPTIONS (STEALTH)
-# =====================================
-options = Options()
-
-# -----------------------------
-# HEADLESS (REQUIRED FOR CI)
-# -----------------------------
-options.add_argument("--headless=new")   # modern headless mode
-options.add_argument("--no-sandbox")
-
-# -----------------------------
-# STEALTH / ANTI-BOT
-# -----------------------------
-options.add_argument("--disable-blink-features=AutomationControlled")
-options.add_argument("--disable-infobars")
-options.add_argument("--disable-notifications")
-options.add_argument("--disable-extensions")
-
-options.add_experimental_option("excludeSwitches", ["enable-automation"])
-options.add_experimental_option("useAutomationExtension", False)
-
-service = Service(CHROMEDRIVER_PATH)
-driver = webdriver.Chrome(service=service, options=options)
-wait = WebDriverWait(driver, 40)
-
-# =====================================
-# HELPERS
-# =====================================
-def to_float(val):
-    return float(val.replace(",", "").strip())
-
+# ============================
+# HELPER FUNCTIONS
+# ============================
 def mround(value, multiple):
     return round(value / multiple) * multiple
 
 def fmt(val):
     return round(val, 2)
 
-# =====================================
-# TRADE LOGIC
-# =====================================
+# ============================
+# TRADE CALCULATION
+# ============================
 def calculate_trade(open_p, high_p, low_p):
     risk_amount = CAPITAL * (RISK_PERCENT / 100)
     range_diff = (high_p - low_p) * ENTRY_RANGE_PERCENT
@@ -94,85 +69,71 @@ def calculate_trade(open_p, high_p, low_p):
         }
     }
 
-# =====================================
-# TABLE EXTRACTION
-# =====================================
-def extract_table(table_id):
-    data = []
-    table = wait.until(EC.presence_of_element_located((By.ID, table_id)))
-    rows = table.find_elements(By.CSS_SELECTOR, "tbody tr")
+# ============================
+# SESSION SETUP
+# ============================
+session = requests.Session()
+session.headers.update(HEADERS)
 
-    for row in rows:
-        cols = row.find_elements(By.TAG_NAME, "td")
-        if len(cols) < 7:
+# Get cookies
+session.get("https://www.nseindia.com", timeout=10)
+
+# ============================
+# FETCH + PROCESS DATA
+# ============================
+final_output = {}
+
+for index_type in ["gainers", "loosers"]:   # NSE spelling
+    print(f"Fetching {index_type.upper()}...")
+
+    response = session.get(
+        URL,
+        params={"index": index_type, "type": "allSec"},
+        timeout=10
+    )
+    response.raise_for_status()
+
+    raw_json = response.json()
+    processed = {}
+
+    # Each index like NIFTY, BANKNIFTY, etc.
+    for index_name, index_data in raw_json.items():
+        if index_name in ["legends"]:
             continue
 
-        open_p = to_float(cols[1].text)
-        high_p = to_float(cols[2].text)
-        low_p = to_float(cols[3].text)
+        if not isinstance(index_data, dict):
+            continue
 
-        stock = {
-            "symbol": cols[0].text.strip(),
-            "open": open_p,
-            "high": high_p,
-            "low": low_p,
-            "prev_close": cols[4].text.strip(),
-            "ltp": cols[5].text.strip(),
-            "percent_change": cols[6].text.strip(),
-            "entry_data": calculate_trade(open_p, high_p, low_p)
-        }
+        stocks = []
 
-        data.append(stock)
+        for stock in index_data.get("data", []):
+            open_p = stock.get("open_price")
+            high_p = stock.get("high_price")
+            low_p = stock.get("low_price")
 
-    return data
+            if not all([open_p, high_p, low_p]):
+                continue
 
-def click_tab(tab_id):
-    tab = wait.until(EC.element_to_be_clickable((By.ID, tab_id)))
-    driver.execute_script("arguments[0].click();", tab)
-    time.sleep(2)
+            stocks.append({
+                "symbol": stock.get("symbol"),
+                "series": stock.get("series"),
+                "open_price": open_p,
+                "high_price": high_p,
+                "low_price": low_p,
+                "ltp": stock.get("ltp"),
+                "prev_price": stock.get("prev_price"),
+                "entry_data": calculate_trade(open_p, high_p, low_p)
+            })
 
-# =====================================
-# START SCRAPING
-# =====================================
-driver.get(URL)
-time.sleep(5)
+        if stocks:
+            processed[index_name] = stocks
 
-final_data = {}
+    final_output[index_type] = processed
 
-index_select = Select(wait.until(EC.presence_of_element_located((By.ID, "index0"))))
-index_options = index_select.options
-
-as_on_date = driver.find_element(By.CLASS_NAME, "asondate").text.strip()
-
-for option in index_options:
-    value = option.get_attribute("value")
-    name = option.text.strip()
-
-    if value == "-1":
-        continue
-
-    print(f"Fetching: {name}")
-
-    index_select.select_by_value(value)
-    time.sleep(4)
-
-    final_data[name] = {
-        "as_on": as_on_date,
-        "gainers": [],
-        "losers": []
-    }
-
-    click_tab("GAINERS")
-    final_data[name]["gainers"] = extract_table("topgainer-Table")
-
-    click_tab("LOSERS")
-    final_data[name]["losers"] = extract_table("toplosers-Table")
-
-# =====================================
+# ============================
 # SAVE JSON
-# =====================================
-with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-    json.dump(final_data, f, indent=4)
+# ============================
+with open("file.json", "w", encoding="utf-8") as f:
+    json.dump(final_output, f, indent=4)
 
-print(f"\n✅ Data saved to {OUTPUT_FILE}")
-driver.quit()
+print("✅ Final processed data saved to file.json")
