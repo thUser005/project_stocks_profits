@@ -1,9 +1,5 @@
-import os
 import json
 import time
-import stat
-import zipfile
-import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -14,13 +10,7 @@ from selenium.webdriver.support import expected_conditions as EC
 # =====================================
 # CONFIG
 # =====================================
-CHROMEDRIVER_NAME = "chromedriver"
-CHROMEDRIVER_ZIP = "chromedriver-linux64.zip"
-CHROMEDRIVER_URL = (
-    "https://storage.googleapis.com/chrome-for-testing-public/"
-    "143.0.7499.169/linux64/chromedriver-linux64.zip"
-)
-
+CHROMEDRIVER_PATH = r"chromedriver"
 URL = "https://www.nseindia.com/market-data/top-gainers-losers"
 OUTPUT_FILE = "nse_top_gainers_losers.json"
 
@@ -31,63 +21,17 @@ ENTRY_RANGE_PERCENT = 0.55
 SL_PERCENT = 1.35
 
 # =====================================
-# AUTO DOWNLOAD CHROMEDRIVER
+# CHROME OPTIONS (STEALTH)
 # =====================================
-def ensure_chromedriver():
-    if os.path.exists(CHROMEDRIVER_NAME):
-        print("✅ ChromeDriver already present")
-        return
-
-    print("⬇️ ChromeDriver not found. Downloading...")
-
-    r = requests.get(CHROMEDRIVER_URL, timeout=30)
-    with open(CHROMEDRIVER_ZIP, "wb") as f:
-        f.write(r.content)
-
-    with zipfile.ZipFile(CHROMEDRIVER_ZIP, "r") as zip_ref:
-        zip_ref.extractall(".")
-
-    extracted_path = "chromedriver-linux64/chromedriver"
-
-    if not os.path.exists(extracted_path):
-        raise Exception("❌ ChromeDriver extraction failed")
-
-    os.rename(extracted_path, CHROMEDRIVER_NAME)
-    os.chmod(CHROMEDRIVER_NAME, stat.S_IRWXU)
-
-    # Cleanup
-    os.remove(CHROMEDRIVER_ZIP)
-    os.system("rm -rf chromedriver-linux64")
-
-    print("✅ ChromeDriver downloaded & ready")
-
-# =====================================
-# SETUP DRIVER
-# =====================================
-ensure_chromedriver()
-
 options = Options()
-
-# -----------------------------
-# HEADLESS (REQUIRED FOR CI)
-# -----------------------------
-options.add_argument("--headless=new")   # modern headless mode
-options.add_argument("--no-sandbox")
-options.add_argument("--disable-dev-shm-usage")
-options.add_argument("--window-size=1920,1080")
-
-# -----------------------------
-# STEALTH / ANTI-BOT
-# -----------------------------
 options.add_argument("--disable-blink-features=AutomationControlled")
 options.add_argument("--disable-infobars")
 options.add_argument("--disable-notifications")
 options.add_argument("--disable-extensions")
-
 options.add_experimental_option("excludeSwitches", ["enable-automation"])
 options.add_experimental_option("useAutomationExtension", False)
 
-service = Service(os.path.abspath(CHROMEDRIVER_NAME))
+service = Service(CHROMEDRIVER_PATH)
 driver = webdriver.Chrome(service=service, options=options)
 wait = WebDriverWait(driver, 40)
 
@@ -110,11 +54,13 @@ def calculate_trade(open_p, high_p, low_p):
     risk_amount = CAPITAL * (RISK_PERCENT / 100)
     range_diff = (high_p - low_p) * ENTRY_RANGE_PERCENT
 
+    # BUY
     buy_entry = mround(open_p + range_diff, 0.05)
     buy_sl = mround(buy_entry - (buy_entry * SL_PERCENT / 100), 0.05)
     buy_diff = buy_entry - buy_sl
     buy_qty = round(risk_amount / buy_diff) if buy_diff > 0 else 0
 
+    # SELL
     sell_entry = mround(open_p - range_diff, 0.05)
     sell_sl = mround(sell_entry + (sell_entry * SL_PERCENT / 100), 0.05)
     sell_diff = sell_sl - sell_entry
@@ -154,7 +100,7 @@ def extract_table(table_id):
         high_p = to_float(cols[2].text)
         low_p = to_float(cols[3].text)
 
-        data.append({
+        stock = {
             "symbol": cols[0].text.strip(),
             "open": open_p,
             "high": high_p,
@@ -163,7 +109,9 @@ def extract_table(table_id):
             "ltp": cols[5].text.strip(),
             "percent_change": cols[6].text.strip(),
             "entry_data": calculate_trade(open_p, high_p, low_p)
-        })
+        }
+
+        data.append(stock)
 
     return data
 
@@ -192,7 +140,7 @@ for option in index_options:
     if value == "-1":
         continue
 
-    print(f"📊 Fetching: {name}")
+    print(f"Fetching: {name}")
 
     index_select.select_by_value(value)
     time.sleep(4)
