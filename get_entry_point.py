@@ -1,5 +1,8 @@
 import requests
 import json
+import os
+from pymongo import MongoClient
+from datetime import datetime
 
 # ============================
 # NSE CONFIG
@@ -23,6 +26,17 @@ CAPITAL = 50000
 RISK_PERCENT = 1
 ENTRY_RANGE_PERCENT = 0.55
 SL_PERCENT = 1.35
+
+# ============================
+# MONGODB CONFIG (FROM SECRETS)
+# ============================
+MONGO_URL = os.getenv("MONGO_URL")
+
+if not MONGO_URL:
+    raise Exception("❌ MONGO_URL not found in environment variables")
+
+DB_NAME = "nse_data"
+COLLECTION_NAME = "entry_points"
 
 # ============================
 # HELPER FUNCTIONS
@@ -70,12 +84,19 @@ def calculate_trade(open_p, high_p, low_p):
     }
 
 # ============================
-# SESSION SETUP
+# MONGODB CONNECTION
+# ============================
+client = MongoClient(MONGO_URL)
+db = client[DB_NAME]
+collection = db[COLLECTION_NAME]
+
+# ============================
+# NSE SESSION SETUP
 # ============================
 session = requests.Session()
 session.headers.update(HEADERS)
 
-# Get cookies
+# Initialize cookies (IMPORTANT FOR NSE)
 session.get("https://www.nseindia.com", timeout=10)
 
 # ============================
@@ -84,7 +105,7 @@ session.get("https://www.nseindia.com", timeout=10)
 final_output = {}
 
 for index_type in ["gainers", "loosers"]:   # NSE spelling
-    print(f"Fetching {index_type.upper()}...")
+    print(f"📡 Fetching {index_type.upper()}...")
 
     response = session.get(
         URL,
@@ -96,9 +117,8 @@ for index_type in ["gainers", "loosers"]:   # NSE spelling
     raw_json = response.json()
     processed = {}
 
-    # Each index like NIFTY, BANKNIFTY, etc.
     for index_name, index_data in raw_json.items():
-        if index_name in ["legends"]:
+        if index_name == "legends":
             continue
 
         if not isinstance(index_data, dict):
@@ -131,9 +151,24 @@ for index_type in ["gainers", "loosers"]:   # NSE spelling
     final_output[index_type] = processed
 
 # ============================
-# SAVE JSON
+# SAVE TO MONGODB (UPSERT DAILY)
 # ============================
-with open("file.json", "w", encoding="utf-8") as f:
-    json.dump(final_output, f, indent=4)
+today = datetime.utcnow().strftime("%Y-%m-%d")
 
-print("✅ Final processed data saved to file.json")
+document = {
+    "date": today,
+    "created_at": datetime.utcnow(),
+    "capital": CAPITAL,
+    "risk_percent": RISK_PERCENT,
+    "entry_range_percent": ENTRY_RANGE_PERCENT,
+    "sl_percent": SL_PERCENT,
+    "data": final_output
+}
+
+collection.update_one(
+    {"date": today},
+    {"$set": document},
+    upsert=True
+)
+
+print("✅ NSE entry data saved to MongoDB Atlas successfully")

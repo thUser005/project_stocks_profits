@@ -1,7 +1,12 @@
 name: Run NSE Entry Point Script
 
 on:
-  workflow_dispatch:   
+  # Manual trigger (optional, keep it)
+  workflow_dispatch:
+
+  # Automatic trigger (Mon–Fri, 9:15 AM IST)
+  schedule:
+    - cron: "15 3 * * 1-5"
 
 jobs:
   run-script:
@@ -26,14 +31,15 @@ jobs:
       # Install Dependencies
       # ----------------------------
       - name: Install Python dependencies
+
         run: |
-          pip install selenium requests
+          pip install selenium requests pymongo
 
       # ----------------------------
       # Run Script
       # ----------------------------
       - name: Run get_entry_point.py
+        env:
+          MONGO_URL: ${{ secrets.MONGO_URL }}      
         run: |
           python get_entry_point.py
-
-     
