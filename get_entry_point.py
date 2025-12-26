@@ -24,10 +24,21 @@ SL_PERCENT = 1.35
 # CHROME OPTIONS (STEALTH)
 # =====================================
 options = Options()
+
+# -----------------------------
+# HEADLESS (REQUIRED FOR CI)
+# -----------------------------
+options.add_argument("--headless=new")   # modern headless mode
+options.add_argument("--no-sandbox")
+
+# -----------------------------
+# STEALTH / ANTI-BOT
+# -----------------------------
 options.add_argument("--disable-blink-features=AutomationControlled")
 options.add_argument("--disable-infobars")
 options.add_argument("--disable-notifications")
 options.add_argument("--disable-extensions")
+
 options.add_experimental_option("excludeSwitches", ["enable-automation"])
 options.add_experimental_option("useAutomationExtension", False)
 
