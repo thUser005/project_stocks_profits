@@ -1,0 +1,39 @@
+name: Run NSE Entry Point Script
+
+on:
+  workflow_dispatch:   
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ----------------------------
+      # Checkout Repository
+      # ----------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ----------------------------
+      # Setup Python
+      # ----------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ----------------------------
+      # Install Dependencies
+      # ----------------------------
+      - name: Install Python dependencies
+        run: |
+          pip install selenium requests
+
+      # ----------------------------
+      # Run Script
+      # ----------------------------
+      - name: Run get_entry_point.py
+        run: |
+          python get_entry_point.py
+
+     
