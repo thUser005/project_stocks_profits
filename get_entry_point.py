@@ -1,5 +1,12 @@
 import requests
 import json
+import os
+from pymongo import MongoClient
+from datetime import datetime, timezone
+
+
+is_replaced = False 
+
 
 # ============================
 # NSE CONFIG
@@ -25,6 +32,16 @@ ENTRY_RANGE_PERCENT = 0.55
 SL_PERCENT = 1.35
 
 # ============================
+# MONGODB CONFIG
+# ============================
+MONGO_URL = os.getenv("MONGO_URL")
+if not MONGO_URL:
+    raise Exception("❌ MONGO_URL not found")
+
+DB_NAME = "nse_data"
+COLLECTION_NAME = "entry_points"
+
+# ============================
 # HELPER FUNCTIONS
 # ============================
 def mround(value, multiple):
@@ -40,13 +57,11 @@ def calculate_trade(open_p, high_p, low_p):
     risk_amount = CAPITAL * (RISK_PERCENT / 100)
     range_diff = (high_p - low_p) * ENTRY_RANGE_PERCENT
 
-    # BUY
     buy_entry = mround(open_p + range_diff, 0.05)
     buy_sl = mround(buy_entry - (buy_entry * SL_PERCENT / 100), 0.05)
     buy_diff = buy_entry - buy_sl
     buy_qty = round(risk_amount / buy_diff) if buy_diff > 0 else 0
 
-    # SELL
     sell_entry = mround(open_p - range_diff, 0.05)
     sell_sl = mround(sell_entry + (sell_entry * SL_PERCENT / 100), 0.05)
     sell_diff = sell_sl - sell_entry
@@ -70,21 +85,29 @@ def calculate_trade(open_p, high_p, low_p):
     }
 
 # ============================
-# SESSION SETUP
+# MONGODB CONNECTION
+# ============================
+client = MongoClient(MONGO_URL)
+db = client[DB_NAME]
+collection = db[COLLECTION_NAME]
+
+# ============================
+# NSE SESSION
 # ============================
 session = requests.Session()
 session.headers.update(HEADERS)
-
-# Get cookies
 session.get("https://www.nseindia.com", timeout=10)
 
 # ============================
 # FETCH + PROCESS DATA
 # ============================
-final_output = {}
+final_output = {
+    "gainers": [],
+    "loosers": []
+}
 
-for index_type in ["gainers", "loosers"]:   # NSE spelling
-    print(f"Fetching {index_type.upper()}...")
+for index_type in ["gainers", "loosers"]:
+    print(f"📡 Fetching {index_type.upper()}")
 
     response = session.get(
         URL,
@@ -94,17 +117,12 @@ for index_type in ["gainers", "loosers"]:   # NSE spelling
     response.raise_for_status()
 
     raw_json = response.json()
-    processed = {}
 
-    # Each index like NIFTY, BANKNIFTY, etc.
     for index_name, index_data in raw_json.items():
-        if index_name in ["legends"]:
+        if index_name == "legends":
             continue
-
         if not isinstance(index_data, dict):
             continue
-
-        stocks = []
 
         for stock in index_data.get("data", []):
             open_p = stock.get("open_price")
@@ -114,7 +132,8 @@ for index_type in ["gainers", "loosers"]:   # NSE spelling
             if not all([open_p, high_p, low_p]):
                 continue
 
-            stocks.append({
+            final_output[index_type].append({
+                "index": index_name,
                 "symbol": stock.get("symbol"),
                 "series": stock.get("series"),
                 "open_price": open_p,
@@ -125,15 +144,30 @@ for index_type in ["gainers", "loosers"]:   # NSE spelling
                 "entry_data": calculate_trade(open_p, high_p, low_p)
             })
 
-        if stocks:
-            processed[index_name] = stocks
-
-    final_output[index_type] = processed
-
 # ============================
-# SAVE JSON
+# SAVE TO MONGODB (WITH FLAG)
 # ============================
-with open("file.json", "w", encoding="utf-8") as f:
-    json.dump(final_output, f, indent=4)
+today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-print("✅ Final processed data saved to file.json")
+existing_doc = collection.find_one({"date": today})
+
+
+document = {
+    "date": today,
+    "created_at": datetime.now(timezone.utc),
+    "is_replaced": is_replaced,
+    "capital": CAPITAL,
+    "risk_percent": RISK_PERCENT,
+    "entry_range_percent": ENTRY_RANGE_PERCENT,
+    "sl_percent": SL_PERCENT,
+    "data": final_output
+}
+
+collection.update_one(
+    {"date": today},
+    {"$set": document},
+    upsert=True
+)
+
+
+print(f"✅ NSE data saved | replaced={is_replaced}")
