@@ -12,18 +12,57 @@ from datetime import datetime, timezone
 # CONFIG
 # =====================================================
 UNDERLYINGS = {
-    "NIFTY": "https://groww.in/options/nifty",
-    "BANKNIFTY": "https://groww.in/options/nifty-bank",
-    "SENSEX": "https://groww.in/options/sp-bse-sensex",
-    "FINNIFTY": "https://groww.in/options/nifty-financial-services",
-    "MIDCPNIFTY": "https://groww.in/options/nifty-midcap-select",
-    "BANKEX": "https://groww.in/options/sp-bse-bankex",
+    "NIFTY": {
+        "url": "https://groww.in/options/nifty",
+        "strike_step": 50,
+        "exchange": "NSE"
+    },
+    "BANKNIFTY": {
+        "url": "https://groww.in/options/nifty-bank",
+        "strike_step": 100,
+        "exchange": "NSE"
+    },
+    "FINNIFTY": {
+        "url": "https://groww.in/options/nifty-financial-services",
+        "strike_step": 50,
+        "exchange": "NSE"
+    },
+    "MIDCPNIFTY": {
+        "url": "https://groww.in/options/nifty-midcap-select",
+        "strike_step": 25,
+        "exchange": "NSE"
+    },
+    "SENSEX": {
+        "url": "https://groww.in/options/sp-bse-sensex",
+        "strike_step": 100,
+        "exchange": "BSE",
+        "index_symbol": "1"
+    },
+    "BANKEX": {
+        "url": "https://groww.in/options/sp-bse-bankex",
+        "strike_step": 100,
+        "exchange": "BSE",
+        "index_symbol": "14"
+    }
 }
+
+STRIKE_WINDOW_POINTS = {
+    "NIFTY": 2000,
+    "BANKNIFTY": 4000,
+    "FINNIFTY": 2000,
+    "MIDCPNIFTY": 1500,
+    "SENSEX": 6000,
+    "BANKEX": 6000,
+}
+
+INDEX_URL = "https://groww.in/v1/api/stocks_data/v1/tr_live_delayed/segment/CASH/latest_aggregated"
 
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 
-# MongoDB
+# =====================================================
+# MONGO
+# =====================================================
 keys_data = None
 if os.path.exists("keys.json"):
     with open("keys.json") as f:
@@ -31,7 +70,7 @@ if os.path.exists("keys.json"):
 
 MONGO_URL = os.getenv("MONGO_URL", keys_data["mongo_url"] if keys_data else None)
 DB_NAME = "options_data"
-COLLECTION_NAME = "nifty_symbols"
+COLLECTION_NAME = "symbols_structural"
 
 if not MONGO_URL:
     raise RuntimeError("❌ MONGO_URL not found")
@@ -44,159 +83,166 @@ HEADERS_HTML = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    )
+}
+
+HEADERS_API = {
+    "accept": "application/json, text/plain, */*",
+    "content-type": "application/json",
+    "x-app-id": "growwWeb"
 }
 
 # =====================================================
-# CONSTANTS
+# HELPERS
 # =====================================================
 MONTH_MAP = {
     "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
     "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
     "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12"
 }
-VALID_MONTHS = set(MONTH_MAP.keys())
 
-# =====================================================
-# HELPERS
-# =====================================================
-def fetch_html_with_retry(url: str) -> str:
-    for i in range(MAX_RETRIES):
+def fetch_html(url: str) -> str:
+    for _ in range(MAX_RETRIES):
         try:
-            print(f"[+] Fetch: {url}")
             r = requests.get(url, headers=HEADERS_HTML, timeout=15)
             r.raise_for_status()
             return r.text
-        except requests.RequestException:
-            if i == MAX_RETRIES - 1:
-                raise
+        except Exception:
             time.sleep(RETRY_DELAY)
+    raise RuntimeError(f"Failed HTML fetch: {url}")
 
-
-def connect_mongo_with_retry() -> MongoClient:
-    for i in range(MAX_RETRIES):
-        try:
-            print("[+] MongoDB connect")
-            client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
-            client.admin.command("ping")
-            return client
-        except errors.PyMongoError:
-            if i == MAX_RETRIES - 1:
-                raise
-            time.sleep(RETRY_DELAY)
-
-
-def normalize_strike(text: str) -> str:
-    return text.replace(",", "")
-
-
-def build_symbol(underlying: str, expiry: str, strike: str) -> str:
-    return f"{underlying}{expiry}{strike}CE"
-
-
-def expiry_text_to_date(text: str, now: datetime) -> Optional[Dict[str, str]]:
-    parts = text.split()
-    if len(parts) != 2:
-        return None
-
-    day, mon = parts
-    mon = mon.upper()
-
-    if mon not in VALID_MONTHS or not day.isdigit():
-        return None
-
-    expiry_month = int(MONTH_MAP[mon])
-    expiry_year = now.year + 1 if expiry_month < now.month else now.year
-
-    full_date = f"{expiry_year}-{MONTH_MAP[mon]}-{day.zfill(2)}"
-
-    return {
-        "date_param": full_date,
-        "symbol_expiry": f"{str(expiry_year)[-2:]}{mon}",
-        "expiry_key": full_date,
+def fetch_live_indexes() -> dict:
+    payload = {
+        "exchangeAggReqMap": {
+            "NSE": {
+                "priceSymbolList": [],
+                "indexSymbolList": ["NIFTY", "BANKNIFTY", "FINNIFTY", "NIFTYMIDSELECT"]
+            },
+            "BSE": {
+                "priceSymbolList": [],
+                "indexSymbolList": ["1", "14"]
+            }
+        }
     }
 
+    r = requests.post(INDEX_URL, headers=HEADERS_API, json=payload, timeout=10)
+    r.raise_for_status()
+    data = r.json()["exchangeAggRespMap"]
 
-def extract_body_texts(html: str) -> List[str]:
+    out = {}
+
+    for ex in data.values():
+        for idx, v in ex["indexLivePointsMap"].items():
+            out[idx] = v["value"]
+
+    return out
+
+def extract_texts(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
     return [e.get_text(strip=True) for e in soup.select(".bodyBaseHeavy")]
 
+def parse_expiry(text: str, now: datetime):
+    p = text.split()
+    if len(p) != 2:
+        return None
 
-def extract_expiry_texts(base_url: str) -> List[str]:
-    html = fetch_html_with_retry(base_url)
-    texts = extract_body_texts(html)
-    return list(dict.fromkeys(texts))
+    day, mon = p
+    mon = mon.upper()
+    if mon not in MONTH_MAP:
+        return None
 
+    year = now.year + (1 if int(MONTH_MAP[mon]) < now.month else 0)
+    return {
+        "expiry_key": f"{year}-{MONTH_MAP[mon]}-{day.zfill(2)}",
+        "symbol_expiry": f"{str(year)[-2:]}{mon}"
+    }
 
-def extract_strikes(expiry_url: str) -> List[str]:
-    html = fetch_html_with_retry(expiry_url)
-    texts = extract_body_texts(html)
-    return sorted(
-        {normalize_strike(t) for t in texts if re.fullmatch(r"\d{1,3}(,\d{3})+", t)},
-        key=int
-    )
+def extract_strikes(expiry_url: str) -> List[int]:
+    html = fetch_html(expiry_url)
+    texts = extract_texts(html)
+    return sorted({
+        int(t.replace(",", ""))
+        for t in texts
+        if re.fullmatch(r"\d{1,3}(,\d{3})+", t)
+    })
+
+def build_symbols(underlying, exp, strikes):
+    symbols = []
+    for s in strikes:
+        symbols.append(f"{underlying}{exp}{s}CE")
+        symbols.append(f"{underlying}{exp}{s}PE")
+    return symbols
 
 # =====================================================
 # CORE
 # =====================================================
-def process_all_underlyings():
+def process():
     now = datetime.now(timezone.utc)
-    trade_date = now.strftime("%Y-%m-%d")
+    live_index = fetch_live_indexes()
 
-    client = connect_mongo_with_retry()
-    collection = client[DB_NAME][COLLECTION_NAME]
+    client = MongoClient(MONGO_URL)
+    col = client[DB_NAME][COLLECTION_NAME]
 
-    final_data: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
+    final = {}
 
-    for underlying, base_url in UNDERLYINGS.items():
-        print(f"\n===== PROCESSING {underlying} =====")
-        final_data[underlying] = {}
+    for name, cfg in UNDERLYINGS.items():
+        print(f"\n=== {name} ===")
+        base_url = cfg["url"]
+        step = cfg["strike_step"]
 
-        raw_expiries = extract_expiry_texts(base_url)
+        idx_key = cfg.get("index_symbol", name)
+        spot = live_index.get(idx_key)
 
-        for exp_text in raw_expiries:
-            exp = expiry_text_to_date(exp_text, now)
+        if not spot:
+            print(f"❌ No live index for {name}")
+            continue
+
+        atm = round(spot / step) * step
+        window = STRIKE_WINDOW_POINTS[name]
+
+        html = fetch_html(base_url)
+        expiry_texts = list(dict.fromkeys(extract_texts(html)))
+
+        final[name] = {}
+
+        for txt in expiry_texts:
+            exp = parse_expiry(txt, now)
             if not exp:
                 continue
 
-            expiry_url = f"{base_url}?expiry={exp['date_param']}"
+            expiry_url = f"{base_url}?expiry={exp['expiry_key']}"
             strikes = extract_strikes(expiry_url)
-            if not strikes:
-                continue
 
-            symbols = [
-                build_symbol(underlying, exp["symbol_expiry"], s)
-                for s in strikes
+            filtered = [
+                s for s in strikes
+                if abs(s - atm) <= window
             ]
 
-            final_data[underlying][exp["expiry_key"]] = {
-                "symbol_expiry": exp["symbol_expiry"],
+            if not filtered:
+                continue
+
+            symbols = build_symbols(name, exp["symbol_expiry"], filtered)
+
+            final[name][exp["expiry_key"]] = {
+                "spot": spot,
+                "atm": atm,
+                "strike_step": step,
                 "symbols": symbols
             }
 
-            print(f"[✓] {underlying} {exp['expiry_key']} → {len(symbols)} symbols")
+            print(f"[✓] {name} {exp['expiry_key']} → {len(symbols)} symbols")
 
-    collection.update_one(
-        {"trade_date": trade_date},
-        {
-            "$set": {
-                "data": final_data,
-                "updated_at": now,
-            },
-            "$setOnInsert": {
-                "created_at": now,
-            },
-        },
-        upsert=True,
+    col.update_one(
+        {"trade_date": now.strftime("%Y-%m-%d")},
+        {"$set": {"data": final, "updated_at": now}},
+        upsert=True
     )
 
     client.close()
-    print("\n[✅] ALL underlyings saved in ONE MongoDB document")
-
+    print("\n✅ Structural symbols saved to MongoDB")
 
 # =====================================================
-# ENTRY POINT
+# ENTRY
 # =====================================================
 if __name__ == "__main__":
-    process_all_underlyings()
+    process()
