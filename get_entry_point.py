@@ -58,7 +58,6 @@ def fetch_html_with_retry(url: str) -> str:
             resp.raise_for_status()
             return resp.text
         except requests.RequestException as e:
-            print(f"[⚠️] Fetch failed: {e}")
             if attempt == MAX_RETRIES:
                 raise
             time.sleep(RETRY_DELAY)
@@ -71,8 +70,7 @@ def connect_mongo_with_retry():
             client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
             client.admin.command("ping")
             return client
-        except errors.PyMongoError as e:
-            print(f"[⚠️] MongoDB connection failed: {e}")
+        except errors.PyMongoError:
             if attempt == MAX_RETRIES:
                 raise
             time.sleep(RETRY_DELAY)
@@ -88,35 +86,26 @@ def build_symbol(symbol: str, expiry: str, strike: str, opt_type: str) -> str:
 
 def expiry_text_to_date(text: str, now: datetime) -> Optional[dict]:
     """
-    Converts '30 Dec' -> expiry date dict
-    Safely ignores DTE / invalid values
+    Accepts only REAL weekly/monthly expiry dates like '30 Dec'
+    Rejects DTE, strikes, UI labels
     """
     parts = text.split()
-
-    # Must be exactly "DD MON"
     if len(parts) != 2:
         return None
 
     day, mon = parts
     mon = mon.upper()
 
-    # Month whitelist check
-    if mon not in VALID_MONTHS:
-        return None
-
-    if not day.isdigit():
+    if not day.isdigit() or mon not in VALID_MONTHS:
         return None
 
     expiry_month = int(MONTH_MAP[mon])
-    current_year = now.year
-    current_month = now.month
-
-    # Handle year rollover
-    expiry_year = current_year + 1 if expiry_month < current_month else current_year
+    expiry_year = now.year + 1 if expiry_month < now.month else now.year
 
     return {
         "date_param": f"{expiry_year}-{MONTH_MAP[mon]}-{day.zfill(2)}",
-        "symbol_expiry": f"{str(expiry_year)[-2:]}{mon}"
+        "symbol_expiry": f"{str(expiry_year)[-2:]}{mon}",
+        "is_weekly": True  # Groww lists only weekly dates here
     }
 
 # =====================================================
@@ -124,17 +113,24 @@ def expiry_text_to_date(text: str, now: datetime) -> Optional[dict]:
 # =====================================================
 html = fetch_html_with_retry(BASE_URL)
 soup = BeautifulSoup(html, "html.parser")
-texts = [el.get_text(strip=True) for el in soup.select(".bodyBaseHeavy")]
+
+# 🔥 VERY IMPORTANT: ONLY SELECT EXPIRY PILLS
+expiry_texts = [
+    el.get_text(strip=True)
+    for el in soup.select("span.bodyBaseHeavy")
+    if re.fullmatch(r"\d{1,2}\s[A-Za-z]{3}", el.get_text(strip=True))
+]
+
+# Remove duplicates while preserving order
+expiry_texts = list(dict.fromkeys(expiry_texts))
+
+if not expiry_texts:
+    raise RuntimeError("❌ No expiry dates found")
+
+print(f"[+] Weekly expiries found: {expiry_texts}")
 
 # =====================================================
-# STEP 2: EXTRACT RAW EXPIRIES (NO ASSUMPTIONS)
-# =====================================================
-raw_expiry_texts = list(dict.fromkeys(texts))
-
-print(f"[+] Found raw expiries: {raw_expiry_texts}")
-
-# =====================================================
-# STEP 3: MONGODB CONNECTION
+# STEP 2: MONGODB CONNECTION
 # =====================================================
 client = connect_mongo_with_retry()
 db = client[DB_NAME]
@@ -144,35 +140,30 @@ now = datetime.now(timezone.utc)
 trade_date = now.strftime("%Y-%m-%d")
 
 # =====================================================
-# STEP 4: PROCESS EACH EXPIRY
+# STEP 3: PROCESS EACH WEEKLY EXPIRY
 # =====================================================
-for exp_text in raw_expiry_texts:
+for exp_text in expiry_texts:
     exp = expiry_text_to_date(exp_text, now)
-
     if not exp:
-        print(f"[⏭️] Ignoring non-calendar expiry: {exp_text}")
         continue
 
     expiry_url = f"{BASE_URL}?expiry={exp['date_param']}"
-    print(f"\n[▶] Processing expiry {exp_text} → {expiry_url}")
+    print(f"\n[▶] Processing weekly expiry {exp_text} → {expiry_url}")
 
     html = fetch_html_with_retry(expiry_url)
     soup = BeautifulSoup(html, "html.parser")
-    texts = [el.get_text(strip=True) for el in soup.select(".bodyBaseHeavy")]
 
     strike_texts = [
-        t for t in texts
-        if re.fullmatch(r"\d{1,3}(,\d{3})+", t)
+        el.get_text(strip=True)
+        for el in soup.select("span.bodyBaseHeavy")
+        if re.fullmatch(r"\d{1,3}(,\d{3})+", el.get_text(strip=True))
     ]
 
     if not strike_texts:
-        print(f"[⚠️] No strikes for expiry {exp_text}, skipping")
+        print(f"[⚠️] No strikes for {exp_text}, skipping")
         continue
 
-    strikes = sorted(
-        set(normalize_strike(s) for s in strike_texts),
-        key=int
-    )
+    strikes = sorted(set(normalize_strike(s) for s in strike_texts), key=int)
 
     symbols: List[str] = []
     for strike in strikes:
@@ -181,23 +172,24 @@ for exp_text in raw_expiry_texts:
 
     print(f"[✓] Generated {len(symbols)} symbols for {exp_text}")
 
-    filter_query = {
-        "underlying": UNDERLYING,
-        "expiry": exp["symbol_expiry"],
-        "trade_date": trade_date,
-    }
-
-    update_doc = {
-        "$set": {
-            "symbols": symbols,
-            "updated_at": now,
+    collection.update_one(
+        {
+            "underlying": UNDERLYING,
+            "expiry": exp["symbol_expiry"],
+            "trade_date": trade_date,
         },
-        "$setOnInsert": {
-            "created_at": now,
+        {
+            "$set": {
+                "symbols": symbols,
+                "expiry_date": exp["date_param"],
+                "is_weekly": True,
+                "updated_at": now,
+            },
+            "$setOnInsert": {"created_at": now},
         },
-    }
+        upsert=True
+    )
 
-    collection.update_one(filter_query, update_doc, upsert=True)
-    print(f"[💾] Saved expiry {exp['symbol_expiry']}")
+    print(f"[💾] Saved weekly expiry {exp['symbol_expiry']}")
 
-print("\n[✅] All expiries processed successfully")
+print("\n[✅] All WEEKLY expiries processed successfully")
