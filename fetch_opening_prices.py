@@ -165,7 +165,7 @@ if os.path.exists("keys.json"):
     with open("keys.json") as f:
         keys = json.load(f)
 
-MONGO_URL = os.getenv("MONGO_URL", keys["mongo_url"] if keys_data else None)
+MONGO_URL = os.getenv("MONGO_URL", keys["mongo_url"] if keys else None)
 
 client = MongoClient(keys["mongo_url"])
 db = client[MONGO_DB]
