@@ -16,8 +16,9 @@ OPTIONS_URL = (
 MONGO_DB = "options_data"
 STRUCTURAL_COLLECTION = "symbols_structural"
 ENTRY_COLLECTION = "entry_plans_live"
+STATUS_COLLECTION = "pipeline_status"
 
-UNDERLYING = "NIFTY"     # change safely now
+UNDERLYING = "NIFTY"        # change safely (BANKNIFTY, FINNIFTY, etc.)
 MAX_BATCH_SIZE = 100
 
 # ---- STRATEGY PARAMS ----
@@ -91,9 +92,6 @@ def pick_nearest_expiry(expiry_map: dict) -> str:
 # 🔥 ADAPTIVE BREAKOUT LOGIC
 # =====================================================
 def adaptive_breakout_pct(open_price: float) -> float:
-    """
-    Option-price-aware breakout %
-    """
     if open_price < 500:
         pct = 0.06
     elif open_price < 1000:
@@ -105,14 +103,10 @@ def adaptive_breakout_pct(open_price: float) -> float:
     else:
         pct = 0.015
 
-    # Safety clamp (never too small / too large)
     return max(0.012, min(pct, 0.06))
 
 
 def capped_move(open_price: float, pct: float, side: str, max_abs_move: float):
-    """
-    Breakout with absolute ₹ safety cap
-    """
     raw = open_price * (1 + pct if side == "BUY" else 1 - pct)
 
     if side == "BUY":
@@ -126,7 +120,7 @@ def build_entry_plan(symbol: str, open_price: float, lot_size: int):
 
     max_abs_move = MAX_ABS_MOVE_BY_UNDERLYING.get(
         UNDERLYING,
-        DEFAULT_MAX_ABS_MOVE  # fallback = NIFTY behavior
+        DEFAULT_MAX_ABS_MOVE
     )
 
     buy_trigger = capped_move(open_price, bpct, "BUY", max_abs_move)
@@ -140,17 +134,14 @@ def build_entry_plan(symbol: str, open_price: float, lot_size: int):
         "symbol": symbol,
         "open": round(open_price, 2),
 
-        # ---- BUY ----
         "buy_trigger": round(buy_trigger, 2),
         "buy_sl": round(buy_trigger * (1 - STOPLOSS_PCT), 2),
         "buy_target": round(buy_trigger * (1 + TARGET_PCT), 2),
 
-        # ---- SELL ----
         "sell_trigger": round(sell_trigger, 2),
         "sell_sl": round(sell_trigger * (1 + STOPLOSS_PCT), 2),
         "sell_target": round(sell_trigger * (1 - TARGET_PCT), 2),
 
-        # ---- META ----
         "breakout_pct_used": round(bpct, 4),
         "max_abs_move_used": max_abs_move,
         "lot_size": lot_size,
@@ -165,7 +156,7 @@ def build_entry_plan(symbol: str, open_price: float, lot_size: int):
 # =====================================================
 # MONGO CONNECT
 # =====================================================
-with open(r"D:\files\projects_v1\upstock_options\project_stocks_profits\keys.json") as f:
+with open("keys.json") as f:
     keys = json.load(f)
 
 client = MongoClient(keys["mongo_url"])
@@ -173,6 +164,7 @@ db = client[MONGO_DB]
 
 structural_col = db[STRUCTURAL_COLLECTION]
 entry_col = db[ENTRY_COLLECTION]
+status_col = db[STATUS_COLLECTION]
 
 # =====================================================
 # LOAD STRUCTURAL SYMBOLS
@@ -194,7 +186,6 @@ if not ce_symbols:
 
 print(f"📦 Loaded {len(ce_symbols)} CE symbols")
 print(f"📅 Using expiry: {expiry_key}")
-print(f"🛡 Max ₹ move cap: {MAX_ABS_MOVE_BY_UNDERLYING.get(UNDERLYING, DEFAULT_MAX_ABS_MOVE)}")
 
 # =====================================================
 # FETCH LIVE PRICES
@@ -227,7 +218,6 @@ for symbol, d in live_prices.items():
         continue
 
     plan = build_entry_plan(symbol, open_price, lot_size)
-
     plan.update({
         "underlying": UNDERLYING,
         "expiry": expiry_key,
@@ -239,7 +229,7 @@ for symbol, d in live_prices.items():
     entry_docs.append(plan)
 
 # =====================================================
-# SAVE TO MONGO
+# SAVE ENTRY PLANS
 # =====================================================
 if entry_docs:
     entry_col.delete_many({
@@ -249,6 +239,32 @@ if entry_docs:
     })
     entry_col.insert_many(entry_docs)
 
-print(f"\n✅ Saved {len(entry_docs)} adaptive entry plans → {ENTRY_COLLECTION}")
+# =====================================================
+# SAVE PIPELINE STATUS
+# =====================================================
+today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+status_col.update_one(
+    {
+        "underlying": UNDERLYING,
+        "trade_date": today_str,
+        "run_type": "ENTRY_PLAN"
+    },
+    {
+        "$set": {
+            "expiry": expiry_key,
+            "entry_data_saved": True,
+            "entry_count": len(entry_docs),
+            "updated_at": datetime.now(timezone.utc)
+        },
+        "$setOnInsert": {
+            "created_at": datetime.now(timezone.utc)
+        }
+    },
+    upsert=True
+)
+
+print(f"\n✅ Saved {len(entry_docs)} entry plans")
+print(f"📌 Pipeline status recorded for {today_str}")
 
 client.close()
