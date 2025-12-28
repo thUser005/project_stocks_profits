@@ -3,18 +3,20 @@ import requests
 import re
 import time
 from bs4 import BeautifulSoup
-from typing import List
+from typing import List, Dict
 from pymongo import MongoClient, errors
 from datetime import datetime
 
 # =====================================================
 # CONFIG
 # =====================================================
-EXPIRY_YEAR = "26"
 UNDERLYING = "NIFTY"
+YEAR_PREFIX = "20"           # for 2026, 2027 etc
 
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds
+
+BASE_URL = "https://groww.in/options/nifty"
 
 # MongoDB
 MONGO_URL = os.getenv("MONGO_URL")
@@ -39,134 +41,143 @@ HEADERS_HTML = {
 # =====================================================
 # HELPERS
 # =====================================================
+MONTH_MAP = {
+    "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
+    "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
+    "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12"
+}
+
+def fetch_html_with_retry(url: str) -> str:
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            print(f"[+] Fetch attempt {attempt}: {url}")
+            resp = requests.get(url, headers=HEADERS_HTML, timeout=15)
+            resp.raise_for_status()
+            return resp.text
+        except requests.RequestException as e:
+            print(f"[⚠️] Fetch failed: {e}")
+            if attempt == MAX_RETRIES:
+                raise
+            time.sleep(RETRY_DELAY)
+
+def connect_mongo_with_retry():
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
+            client.admin.command("ping")
+            return client
+        except errors.PyMongoError:
+            if attempt == MAX_RETRIES:
+                raise
+            time.sleep(RETRY_DELAY)
+
 def normalize_strike(text: str) -> str:
     return text.replace(",", "")
 
 def build_symbol(symbol: str, expiry: str, strike: str, opt_type: str) -> str:
     return f"{symbol}{expiry}{strike}{opt_type}"
 
-def fetch_html_with_retry(url: str) -> str:
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            print(f"[+] Fetch attempt {attempt}")
-            resp = requests.get(url, headers=HEADERS_HTML, timeout=15)
-            resp.raise_for_status()
-            return resp.text
-        except requests.RequestException as e:
-            print(f"[⚠️] Fetch failed (attempt {attempt}): {e}")
-            if attempt == MAX_RETRIES:
-                raise RuntimeError("❌ HTML fetch failed after max retries")
-            time.sleep(RETRY_DELAY)
+def expiry_text_to_date(text: str, year: int) -> Dict[str, str]:
+    """
+    '06 Jan' -> {
+        'date_param': '2026-01-06',
+        'symbol_expiry': '26JAN'
+    }
+    """
+    day, mon = text.split()
+    mon = mon.upper()
 
-def connect_mongo_with_retry():
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            print(f"[+] MongoDB connect attempt {attempt}")
-            client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
-            client.admin.command("ping")
-            return client
-        except errors.PyMongoError as e:
-            print(f"[⚠️] MongoDB connection failed (attempt {attempt}): {e}")
-            if attempt == MAX_RETRIES:
-                raise RuntimeError("❌ MongoDB connection failed after max retries")
-            time.sleep(RETRY_DELAY)
+    date_param = f"{year}-{MONTH_MAP[mon]}-{day.zfill(2)}"
+    symbol_expiry = f"{str(year)[-2:]}{mon}"
+
+    return {
+        "date_param": date_param,
+        "symbol_expiry": symbol_expiry
+    }
 
 # =====================================================
-# STEP 1: FETCH HTML
+# STEP 1: FETCH BASE PAGE
 # =====================================================
-html_url = "https://groww.in/options/nifty"
-html = fetch_html_with_retry(html_url)
-
+html = fetch_html_with_retry(BASE_URL)
 soup = BeautifulSoup(html, "html.parser")
 texts = [el.get_text(strip=True) for el in soup.select(".bodyBaseHeavy")]
 
-if not texts:
-    raise RuntimeError("❌ No text extracted from HTML")
+# =====================================================
+# STEP 2: EXTRACT EXPIRY DATES (e.g. 30 Dec, 06 Jan)
+# =====================================================
+expiry_texts = []
+for t in texts:
+    if re.fullmatch(r"\d{2}\s[A-Za-z]{3}", t):
+        expiry_texts.append(t)
 
-print(f"[+] Raw text items: {len(texts)}")
+expiry_texts = list(dict.fromkeys(expiry_texts))  # unique, ordered
+
+if not expiry_texts:
+    raise RuntimeError("❌ No expiry dates found")
+
+print(f"[+] Found expiries: {expiry_texts}")
 
 # =====================================================
-# STEP 2: DETECT EXPIRY
-# =====================================================
-expiry = None
-for i, val in enumerate(texts):
-    if val == UNDERLYING:
-        for j in range(i + 1, len(texts)):
-            if re.fullmatch(r"\d{2}\s[A-Za-z]{3}", texts[j]):
-                _, mon = texts[j].split(" ")
-                expiry = f"{EXPIRY_YEAR}{mon.upper()}"
-                break
-        break
-
-if not expiry:
-    raise RuntimeError("❌ Expiry detection failed")
-
-print(f"[+] Detected expiry: {expiry}")
-
-# =====================================================
-# STEP 3: EXTRACT STRIKES
-# =====================================================
-strike_texts = [
-    t for t in texts
-    if re.fullmatch(r"\d{1,3}(,\d{3})+", t)
-]
-
-if not strike_texts:
-    raise RuntimeError("❌ No strikes found")
-
-strikes = sorted(
-    set(normalize_strike(s) for s in strike_texts),
-    key=int
-)
-
-print(f"[+] Found {len(strikes)} strikes")
-
-# =====================================================
-# STEP 4: BUILD CE SYMBOLS
-# =====================================================
-symbols: List[str] = []
-
-for strike in strikes:
-    symbols.append(build_symbol(UNDERLYING, expiry, strike, "CE"))
-
-print(f"[+] Generated {len(symbols)} option symbols")
-
-# =====================================================
-# STEP 5: UPSERT TO MONGODB (DATE-BASED)
+# STEP 3: MONGODB CONNECTION
 # =====================================================
 client = connect_mongo_with_retry()
 db = client[DB_NAME]
 collection = db[COLLECTION_NAME]
 
 trade_date = datetime.utcnow().strftime("%Y-%m-%d")
+year = datetime.utcnow().year
 
-filter_query = {
-    "underlying": UNDERLYING,
-    "expiry": expiry,
-    "trade_date": trade_date,
-}
+# =====================================================
+# STEP 4: PROCESS EACH EXPIRY
+# =====================================================
+for exp_text in expiry_texts:
+    exp = expiry_text_to_date(exp_text, year)
 
-update_doc = {
-    "$set": {
-        "symbols": symbols,
-        "updated_at": datetime.utcnow(),
-    },
-    "$setOnInsert": {
-        "created_at": datetime.utcnow(),
-    },
-}
+    expiry_url = f"{BASE_URL}?expiry={exp['date_param']}"
+    print(f"\n[▶] Processing expiry {exp_text} → {expiry_url}")
 
-try:
-    result = collection.update_one(
-        filter_query,
-        update_doc,
-        upsert=True
+    html = fetch_html_with_retry(expiry_url)
+    soup = BeautifulSoup(html, "html.parser")
+    texts = [el.get_text(strip=True) for el in soup.select(".bodyBaseHeavy")]
+
+    strike_texts = [
+        t for t in texts
+        if re.fullmatch(r"\d{1,3}(,\d{3})+", t)
+    ]
+
+    if not strike_texts:
+        print(f"[⚠️] No strikes for expiry {exp_text}, skipping")
+        continue
+
+    strikes = sorted(
+        set(normalize_strike(s) for s in strike_texts),
+        key=int
     )
 
-    if result.matched_count > 0:
-        print(f"[🔁] Updated existing document for {trade_date}")
-    else:
-        print(f"[➕] Inserted new document for {trade_date}")
+    symbols: List[str] = []
+    for strike in strikes:
+        symbols.append(build_symbol(UNDERLYING, exp["symbol_expiry"], strike, "CE"))
+        symbols.append(build_symbol(UNDERLYING, exp["symbol_expiry"], strike, "PE"))
 
-except errors.PyMongoError as e:
-    raise RuntimeError(f"❌ MongoDB upsert failed: {e}")
+    print(f"[✓] Generated {len(symbols)} symbols for {exp_text}")
+
+    filter_query = {
+        "underlying": UNDERLYING,
+        "expiry": exp["symbol_expiry"],
+        "trade_date": trade_date,
+    }
+
+    update_doc = {
+        "$set": {
+            "symbols": symbols,
+            "updated_at": datetime.utcnow(),
+        },
+        "$setOnInsert": {
+            "created_at": datetime.utcnow(),
+        },
+    }
+
+    collection.update_one(filter_query, update_doc, upsert=True)
+    print(f"[💾] Saved expiry {exp['symbol_expiry']}")
+
+print("\n[✅] All expiries processed successfully")
