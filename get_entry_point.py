@@ -86,7 +86,7 @@ if not texts:
 print(f"[+] Raw text items: {len(texts)}")
 
 # =====================================================
-# STEP 2: DETECT EXPIRY (26DEC, 26JAN, etc.)
+# STEP 2: DETECT EXPIRY
 # =====================================================
 expiry = None
 for i, val in enumerate(texts):
@@ -122,33 +122,51 @@ strikes = sorted(
 print(f"[+] Found {len(strikes)} strikes")
 
 # =====================================================
-# STEP 4: BUILD CE + PE SYMBOLS (EXACT FORMAT)
+# STEP 4: BUILD CE SYMBOLS
 # =====================================================
 symbols: List[str] = []
 
 for strike in strikes:
     symbols.append(build_symbol(UNDERLYING, expiry, strike, "CE"))
-    symbols.append(build_symbol(UNDERLYING, expiry, strike, "PE"))
 
 print(f"[+] Generated {len(symbols)} option symbols")
-print(symbols)   # optional, matches your local output
 
 # =====================================================
-# STEP 5: SAVE TO MONGODB
+# STEP 5: UPSERT TO MONGODB (DATE-BASED)
 # =====================================================
 client = connect_mongo_with_retry()
 db = client[DB_NAME]
 collection = db[COLLECTION_NAME]
 
-doc = {
+trade_date = datetime.utcnow().strftime("%Y-%m-%d")
+
+filter_query = {
     "underlying": UNDERLYING,
     "expiry": expiry,
-    "symbols": symbols,
-    "created_at": datetime.utcnow(),
+    "trade_date": trade_date,
+}
+
+update_doc = {
+    "$set": {
+        "symbols": symbols,
+        "updated_at": datetime.utcnow(),
+    },
+    "$setOnInsert": {
+        "created_at": datetime.utcnow(),
+    },
 }
 
 try:
-    collection.insert_one(doc)
-    print(f"[✅] Saved {len(symbols)} symbols to MongoDB")
+    result = collection.update_one(
+        filter_query,
+        update_doc,
+        upsert=True
+    )
+
+    if result.matched_count > 0:
+        print(f"[🔁] Updated existing document for {trade_date}")
+    else:
+        print(f"[➕] Inserted new document for {trade_date}")
+
 except errors.PyMongoError as e:
-    raise RuntimeError(f"❌ MongoDB insert failed: {e}")
+    raise RuntimeError(f"❌ MongoDB upsert failed: {e}")
