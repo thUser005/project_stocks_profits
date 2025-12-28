@@ -81,10 +81,6 @@ def build_symbol(symbol: str, expiry: str, strike: str, opt_type: str) -> str:
     return f"{symbol}{expiry}{strike}{opt_type}"
 
 def expiry_text_to_date(text: str, now: datetime) -> dict:
-    """
-    Handles year rollover correctly.
-    Ignores DTE values.
-    """
     day, mon = text.split()
     mon = mon.upper()
 
@@ -92,11 +88,8 @@ def expiry_text_to_date(text: str, now: datetime) -> dict:
     current_year = now.year
     current_month = now.month
 
-    # YEAR ROLLOVER FIX
-    if expiry_month < current_month:
-        expiry_year = current_year + 1
-    else:
-        expiry_year = current_year
+    # Year rollover logic
+    expiry_year = current_year + 1 if expiry_month < current_month else current_year
 
     return {
         "date_param": f"{expiry_year}-{MONTH_MAP[mon]}-{day.zfill(2)}",
@@ -111,17 +104,17 @@ soup = BeautifulSoup(html, "html.parser")
 texts = [el.get_text(strip=True) for el in soup.select(".bodyBaseHeavy")]
 
 # =====================================================
-# STEP 2: EXTRACT ONLY REAL EXPIRY DATES (FILTER DTE)
+# STEP 2: STRICT EXPIRY FILTER (NO DTE)
 # =====================================================
 expiry_texts = [
     t for t in texts
-    if re.fullmatch(r"\d{2}\s[A-Za-z]{3}", t)
+    if re.fullmatch(r"\d{2}\s(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)", t)
 ]
 
 expiry_texts = list(dict.fromkeys(expiry_texts))
 
 if not expiry_texts:
-    raise RuntimeError("❌ No expiry dates found")
+    raise RuntimeError("❌ No valid expiry dates found")
 
 print(f"[+] Found expiries: {expiry_texts}")
 
@@ -136,9 +129,14 @@ now = datetime.now(timezone.utc)
 trade_date = now.strftime("%Y-%m-%d")
 
 # =====================================================
-# STEP 4: PROCESS EACH EXPIRY
+# STEP 4: PROCESS EACH EXPIRY (SAFE LOOP)
 # =====================================================
 for exp_text in expiry_texts:
+
+    # 🚨 EXTRA FAILSAFE (NEVER PROCESS DTE)
+    if "DTE" in exp_text:
+        continue
+
     exp = expiry_text_to_date(exp_text, now)
 
     expiry_url = f"{BASE_URL}?expiry={exp['date_param']}"
@@ -157,10 +155,7 @@ for exp_text in expiry_texts:
         print(f"[⚠️] No strikes for expiry {exp_text}, skipping")
         continue
 
-    strikes = sorted(
-        set(normalize_strike(s) for s in strike_texts),
-        key=int
-    )
+    strikes = sorted(set(normalize_strike(s) for s in strike_texts), key=int)
 
     symbols: List[str] = []
     for strike in strikes:
@@ -169,23 +164,24 @@ for exp_text in expiry_texts:
 
     print(f"[✓] Generated {len(symbols)} symbols for {exp_text}")
 
-    filter_query = {
-        "underlying": UNDERLYING,
-        "expiry": exp["symbol_expiry"],
-        "trade_date": trade_date,
-    }
-
-    update_doc = {
-        "$set": {
-            "symbols": symbols,
-            "updated_at": now,
+    collection.update_one(
+        {
+            "underlying": UNDERLYING,
+            "expiry": exp["symbol_expiry"],
+            "trade_date": trade_date,
         },
-        "$setOnInsert": {
-            "created_at": now,
+        {
+            "$set": {
+                "symbols": symbols,
+                "updated_at": now,
+            },
+            "$setOnInsert": {
+                "created_at": now,
+            },
         },
-    }
+        upsert=True,
+    )
 
-    collection.update_one(filter_query, update_doc, upsert=True)
     print(f"[💾] Saved expiry {exp['symbol_expiry']}")
 
 print("\n[✅] All expiries processed successfully")
