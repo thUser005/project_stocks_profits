@@ -263,7 +263,7 @@ status_col.update_one(
     },
     upsert=True
 )
-
+ 
 print(f"\n✅ Saved {len(entry_docs)} entry plans")
 print(f"📌 Pipeline status recorded for {today_str}")
 
