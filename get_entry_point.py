@@ -105,9 +105,12 @@ def expiry_text_to_date(text: str, now: datetime) -> Optional[Dict[str, str]]:
     expiry_month = int(MONTH_MAP[mon])
     expiry_year = now.year + 1 if expiry_month < now.month else now.year
 
+    full_date = f"{expiry_year}-{MONTH_MAP[mon]}-{day.zfill(2)}"
+
     return {
-        "date_param": f"{expiry_year}-{MONTH_MAP[mon]}-{day.zfill(2)}",
+        "date_param": full_date,
         "symbol_expiry": f"{str(expiry_year)[-2:]}{mon}",
+        "expiry_key": full_date,   # 🔥 UNIQUE KEY
     }
 
 
@@ -148,7 +151,7 @@ def process_expiries():
     raw_expiries = extract_expiry_texts()
     print(f"[+] Found raw expiries: {raw_expiries}")
 
-    all_data: Dict[str, List[str]] = {}
+    all_data: Dict[str, Dict[str, List[str]]] = {}
 
     for exp_text in raw_expiries:
         exp = expiry_text_to_date(exp_text, now)
@@ -167,10 +170,13 @@ def process_expiries():
             for strike in strikes
         ]
 
-        all_data[exp["symbol_expiry"]] = symbols
-        print(f"[✓] Collected {len(symbols)} symbols for {exp['symbol_expiry']}")
+        all_data[exp["expiry_key"]] = {
+            "symbol_expiry": exp["symbol_expiry"],
+            "symbols": symbols
+        }
 
-    # 🔥 SAVE ONCE
+        print(f"[✓] Collected {len(symbols)} symbols for {exp['expiry_key']}")
+
     collection.update_one(
         {"underlying": UNDERLYING, "trade_date": trade_date},
         {
@@ -186,7 +192,7 @@ def process_expiries():
     )
 
     client.close()
-    print("\n[✅] All expiries saved in ONE MongoDB document")
+    print("\n[✅] All expiries saved correctly (NO OVERWRITE)")
 
 
 # =====================================================
