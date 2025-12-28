@@ -1,210 +1,154 @@
-import requests
-import json
 import os
-from pymongo import MongoClient
-from datetime import datetime, timezone
+import requests
+import re
+import time
+from bs4 import BeautifulSoup
+from typing import List
+from pymongo import MongoClient, errors
+from datetime import datetime
 
-# ============================
-# FLAGS
-# ============================
-is_replaced = True
+# =====================================================
+# CONFIG
+# =====================================================
+EXPIRY_YEAR = "26"
+UNDERLYING = "NIFTY"
 
-# ============================
-# NSE CONFIG
-# ============================
-URL = "https://www.nseindia.com/api/live-analysis-variations"
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # seconds
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/121.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/",
-    "Connection": "keep-alive"
+# MongoDB
+MONGO_URL = os.getenv("MONGO_URL")
+DB_NAME = "options_data"
+COLLECTION_NAME = "nifty_symbols"
+
+if not MONGO_URL:
+    raise RuntimeError("❌ MONGO_URL not found in environment variables")
+
+# =====================================================
+# HEADERS
+# =====================================================
+HEADERS_HTML = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# ============================
-# TRADE CONFIG
-# ============================
-CAPITAL = 50000
-RISK_PERCENT = 1
-ENTRY_RANGE_PERCENT = 0.55
-SL_PERCENT = 1.35
+# =====================================================
+# HELPERS
+# =====================================================
+def normalize_strike(text: str) -> str:
+    return text.replace(",", "")
 
-# ============================
-# MONGODB CONFIG
-# ============================
-MONGO_URL = os.getenv("MONGO_URL")
-if not MONGO_URL:
-    raise Exception("❌ MONGO_URL not found")
+def build_symbol(symbol: str, expiry: str, strike: str, opt_type: str) -> str:
+    return f"{symbol}{expiry}{strike}{opt_type}"
 
-DB_NAME = "nse_data"
-COLLECTION_NAME = "entry_points"
+def fetch_html_with_retry(url: str) -> str:
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            print(f"[+] Fetch attempt {attempt}")
+            resp = requests.get(url, headers=HEADERS_HTML, timeout=15)
+            resp.raise_for_status()
+            return resp.text
+        except requests.RequestException as e:
+            print(f"[⚠️] Fetch failed (attempt {attempt}): {e}")
+            if attempt == MAX_RETRIES:
+                raise RuntimeError("❌ HTML fetch failed after max retries")
+            time.sleep(RETRY_DELAY)
 
-# ============================
-# HELPER FUNCTIONS
-# ============================
-def mround(value, multiple):
-    return round(value / multiple) * multiple
+def connect_mongo_with_retry():
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            print(f"[+] MongoDB connect attempt {attempt}")
+            client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
+            client.admin.command("ping")
+            return client
+        except errors.PyMongoError as e:
+            print(f"[⚠️] MongoDB connection failed (attempt {attempt}): {e}")
+            if attempt == MAX_RETRIES:
+                raise RuntimeError("❌ MongoDB connection failed after max retries")
+            time.sleep(RETRY_DELAY)
 
-def fmt(val):
-    return round(val, 2)
+# =====================================================
+# STEP 1: FETCH HTML
+# =====================================================
+html_url = "https://groww.in/options/nifty"
+html = fetch_html_with_retry(html_url)
 
-# ============================
-# TRADE CALCULATION
-# ============================
-def calculate_trade(open_p, high_p, low_p):
-    risk_amount = CAPITAL * (RISK_PERCENT / 100)
-    range_diff = (high_p - low_p) * ENTRY_RANGE_PERCENT
+soup = BeautifulSoup(html, "html.parser")
+texts = [el.get_text(strip=True) for el in soup.select(".bodyBaseHeavy")]
 
-    buy_entry = mround(open_p + range_diff, 0.05)
-    buy_sl = mround(buy_entry - (buy_entry * SL_PERCENT / 100), 0.05)
-    buy_diff = buy_entry - buy_sl
-    buy_qty = round(risk_amount / buy_diff) if buy_diff > 0 else 0
+if not texts:
+    raise RuntimeError("❌ No text extracted from HTML")
 
-    sell_entry = mround(open_p - range_diff, 0.05)
-    sell_sl = mround(sell_entry + (sell_entry * SL_PERCENT / 100), 0.05)
-    sell_diff = sell_sl - sell_entry
-    sell_qty = round(risk_amount / sell_diff) if sell_diff > 0 else 0
+print(f"[+] Raw text items: {len(texts)}")
 
-    return {
-        "capital": fmt(CAPITAL),
-        "risk_amount": fmt(risk_amount),
-        "buy": {
-            "entry": fmt(buy_entry),
-            "stop_loss": fmt(buy_sl),
-            "difference": fmt(buy_diff),
-            "quantity": buy_qty
-        },
-        "sell": {
-            "entry": fmt(sell_entry),
-            "stop_loss": fmt(sell_sl),
-            "difference": fmt(sell_diff),
-            "quantity": sell_qty
-        }
-    }
+# =====================================================
+# STEP 2: DETECT EXPIRY (26DEC, 26JAN, etc.)
+# =====================================================
+expiry = None
+for i, val in enumerate(texts):
+    if val == UNDERLYING:
+        for j in range(i + 1, len(texts)):
+            if re.fullmatch(r"\d{2}\s[A-Za-z]{3}", texts[j]):
+                _, mon = texts[j].split(" ")
+                expiry = f"{EXPIRY_YEAR}{mon.upper()}"
+                break
+        break
 
-# ============================
-# NSE SESSION
-# ============================
-session = requests.Session()
-session.headers.update(HEADERS)
-session.get("https://www.nseindia.com", timeout=10)
+if not expiry:
+    raise RuntimeError("❌ Expiry detection failed")
 
-# ============================
-# FETCH F&O SYMBOLS
-# ============================
-def get_fo_symbols():
-    url = "https://www.nseindia.com/api/equity-stockIndices"
-    params = {"index": "SECURITIES IN F&O"}
+print(f"[+] Detected expiry: {expiry}")
 
-    res = session.get(url, params=params, timeout=10)
-    res.raise_for_status()
+# =====================================================
+# STEP 3: EXTRACT STRIKES
+# =====================================================
+strike_texts = [
+    t for t in texts
+    if re.fullmatch(r"\d{1,3}(,\d{3})+", t)
+]
 
-    data = res.json()
-    return {item["symbol"] for item in data.get("data", [])}
+if not strike_texts:
+    raise RuntimeError("❌ No strikes found")
 
-FO_SYMBOLS = get_fo_symbols()
-print(f"✅ Loaded {len(FO_SYMBOLS)} F&O symbols")
+strikes = sorted(
+    set(normalize_strike(s) for s in strike_texts),
+    key=int
+)
 
-# ============================
-# MONGODB CONNECTION
-# ============================
-client = MongoClient(MONGO_URL)
+print(f"[+] Found {len(strikes)} strikes")
+
+# =====================================================
+# STEP 4: BUILD CE + PE SYMBOLS (EXACT FORMAT)
+# =====================================================
+symbols: List[str] = []
+
+for strike in strikes:
+    symbols.append(build_symbol(UNDERLYING, expiry, strike, "CE"))
+    symbols.append(build_symbol(UNDERLYING, expiry, strike, "PE"))
+
+print(f"[+] Generated {len(symbols)} option symbols")
+print(symbols)   # optional, matches your local output
+
+# =====================================================
+# STEP 5: SAVE TO MONGODB
+# =====================================================
+client = connect_mongo_with_retry()
 db = client[DB_NAME]
 collection = db[COLLECTION_NAME]
 
-# ============================
-# FETCH + PROCESS DATA
-# ============================
-final_output = {
-    "gainers": [],
-    "loosers": []
+doc = {
+    "underlying": UNDERLYING,
+    "expiry": expiry,
+    "symbols": symbols,
+    "created_at": datetime.utcnow(),
 }
 
-# 🔢 COUNTERS
-total_stocks = 0
-option_stocks = 0
-
-for index_type in ["gainers", "loosers"]:
-    print(f"📡 Fetching {index_type.upper()}")
-
-    response = session.get(
-        URL,
-        params={"index": index_type, "type": "allSec"},
-        timeout=10
-    )
-    response.raise_for_status()
-
-    raw_json = response.json()
-
-    for index_name, index_data in raw_json.items():
-        if index_name == "legends":
-            continue
-        if not isinstance(index_data, dict):
-            continue
-
-        for stock in index_data.get("data", []):
-            total_stocks += 1
-
-            symbol = stock.get("symbol")
-
-            # 🔴 FILTER: ONLY OPTION-AVAILABLE STOCKS
-            if symbol not in FO_SYMBOLS:
-                continue
-
-            option_stocks += 1
-
-            open_p = stock.get("open_price")
-            high_p = stock.get("high_price")
-            low_p = stock.get("low_price")
-
-            if not all([open_p, high_p, low_p]):
-                continue
-
-            final_output[index_type].append({
-                "index": index_name,
-                "symbol": symbol,
-                "series": stock.get("series"),
-                "is_option_available": True,
-                "open_price": open_p,
-                "high_price": high_p,
-                "low_price": low_p,
-                "ltp": stock.get("ltp"),
-                "prev_price": stock.get("prev_price"),
-                "entry_data": calculate_trade(open_p, high_p, low_p)
-            })
-
-# ============================
-# PRINT SUMMARY
-# ============================
-percentage = (option_stocks / total_stocks * 100) if total_stocks else 0
-print(f"📊 Option-eligible stocks loaded: {option_stocks} / {total_stocks} ({percentage:.2f}%)")
-
-# ============================
-# SAVE TO MONGODB
-# ============================
-today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-existing_doc = collection.find_one({"date": today})
-is_replaced = True if existing_doc else False
-
-document = {
-    "date": today,
-    "created_at": datetime.now(timezone.utc),
-    "is_replaced": is_replaced,
-    "capital": CAPITAL,
-    "risk_percent": RISK_PERCENT,
-    "entry_range_percent": ENTRY_RANGE_PERCENT,
-    "sl_percent": SL_PERCENT,
-    "data": final_output
-}
-
-collection.update_one(
-    {"date": today},
-    {"$set": document},
-    upsert=True
-)
-
-print(f"✅ ONLY OPTION STOCKS SAVED | replaced={is_replaced}")
+try:
+    collection.insert_one(doc)
+    print(f"[✅] Saved {len(symbols)} symbols to MongoDB")
+except errors.PyMongoError as e:
+    raise RuntimeError(f"❌ MongoDB insert failed: {e}")
