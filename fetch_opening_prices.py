@@ -167,7 +167,7 @@ if os.path.exists("keys.json"):
 
 MONGO_URL = os.getenv("MONGO_URL", keys["mongo_url"] if keys else None)
 
-client = MongoClient(keys["mongo_url"])
+client = MongoClient(MONGO_URL)
 db = client[MONGO_DB]
 
 structural_col = db[STRUCTURAL_COLLECTION]
