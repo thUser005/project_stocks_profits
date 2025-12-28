@@ -1,59 +1,50 @@
-name: Run NSE Entry Point Script
+name: Run NSE Entry Pipeline
 
 on:
-  # ----------------------------
-  # Run when files change
-  # ----------------------------
   push:
-    branches:
-      - main
+    branches: [ main ]
     paths:
       - ".github/workflows/main.yml"
       - "get_entry_point.py"
+      - "fetch_opening_prices.py"
 
-  # ----------------------------
-  # Manual trigger
-  # ----------------------------
   workflow_dispatch:
 
-  # ----------------------------
-  # Automatic trigger (Mon–Fri, 9:15 AM IST)
-  # 03:15 UTC = 09:15 IST
-  # ----------------------------
   schedule:
-    - cron: "15 3 * * 1-5"
+    # 09:15 IST = 03:45 UTC (safer than exact open)
+    - cron: "45 3 * * 1-5"
 
 jobs:
-  run-script:
+  run-pipeline:
     runs-on: ubuntu-latest
 
     steps:
-      # ----------------------------
-      # Checkout Repository
-      # ----------------------------
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ----------------------------
-      # Setup Python
-      # ----------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # ----------------------------
-      # Install Dependencies
-      # ----------------------------
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           pip install requests pymongo bs4
 
       # ----------------------------
-      # Run Script
+      # Step 1: Live Entry Snapshot
       # ----------------------------
-      - name: Run get_entry_point.py
+      - name: Run entry point script
         env:
           MONGO_URL: ${{ secrets.MONGO_URL }}
         run: |
           python get_entry_point.py
+
+      # ----------------------------
+      # Step 2: Fetch Opening Prices
+      # ----------------------------
+      - name: Fetch opening reference prices
+        env:
+          MONGO_URL: ${{ secrets.MONGO_URL }}
+        run: |
+          python fetch_opening_prices.py
