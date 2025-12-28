@@ -1,5 +1,5 @@
 import json
-import math
+import math,os
 import requests
 from pymongo import MongoClient
 from datetime import datetime, timezone
@@ -156,8 +156,16 @@ def build_entry_plan(symbol: str, open_price: float, lot_size: int):
 # =====================================================
 # MONGO CONNECT
 # =====================================================
-with open("keys.json") as f:
-    keys = json.load(f)
+
+# =====================================================
+# MONGO
+# =====================================================
+keys = None
+if os.path.exists("keys.json"):
+    with open("keys.json") as f:
+        keys = json.load(f)
+
+MONGO_URL = os.getenv("MONGO_URL", keys["mongo_url"] if keys_data else None)
 
 client = MongoClient(keys["mongo_url"])
 db = client[MONGO_DB]
