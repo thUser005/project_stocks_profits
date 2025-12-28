@@ -170,7 +170,6 @@ def build_symbols(underlying, exp, strikes):
     symbols = []
     for s in strikes:
         symbols.append(f"{underlying}{exp}{s}CE")
-        symbols.append(f"{underlying}{exp}{s}PE")
     return symbols
 
 # =====================================================
