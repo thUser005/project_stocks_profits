@@ -3,7 +3,7 @@ import requests
 import re
 import time
 from bs4 import BeautifulSoup
-from typing import List, Dict
+from typing import List
 from pymongo import MongoClient, errors
 from datetime import datetime
 
@@ -11,12 +11,10 @@ from datetime import datetime
 # CONFIG
 # =====================================================
 UNDERLYING = "NIFTY"
-YEAR_PREFIX = "20"           # for 2026, 2027 etc
+BASE_URL = "https://groww.in/options/nifty"
 
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds
-
-BASE_URL = "https://groww.in/options/nifty"
 
 # MongoDB
 MONGO_URL = os.getenv("MONGO_URL")
@@ -39,7 +37,7 @@ HEADERS_HTML = {
 }
 
 # =====================================================
-# HELPERS
+# CONSTANTS
 # =====================================================
 MONTH_MAP = {
     "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
@@ -47,6 +45,9 @@ MONTH_MAP = {
     "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12"
 }
 
+# =====================================================
+# HELPERS
+# =====================================================
 def fetch_html_with_retry(url: str) -> str:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -63,10 +64,12 @@ def fetch_html_with_retry(url: str) -> str:
 def connect_mongo_with_retry():
     for attempt in range(1, MAX_RETRIES + 1):
         try:
+            print(f"[+] MongoDB connect attempt {attempt}")
             client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
             client.admin.command("ping")
             return client
-        except errors.PyMongoError:
+        except errors.PyMongoError as e:
+            print(f"[⚠️] MongoDB connection failed: {e}")
             if attempt == MAX_RETRIES:
                 raise
             time.sleep(RETRY_DELAY)
@@ -77,22 +80,29 @@ def normalize_strike(text: str) -> str:
 def build_symbol(symbol: str, expiry: str, strike: str, opt_type: str) -> str:
     return f"{symbol}{expiry}{strike}{opt_type}"
 
-def expiry_text_to_date(text: str, year: int) -> Dict[str, str]:
+def expiry_text_to_date(text: str, now: datetime) -> dict:
     """
-    '06 Jan' -> {
-        'date_param': '2026-01-06',
-        'symbol_expiry': '26JAN'
-    }
+    Correctly handles year rollover.
+    Example (today = Dec 2025):
+      '30 Dec' -> 2025-12-30
+      '06 Jan' -> 2026-01-06
     """
     day, mon = text.split()
     mon = mon.upper()
 
-    date_param = f"{year}-{MONTH_MAP[mon]}-{day.zfill(2)}"
-    symbol_expiry = f"{str(year)[-2:]}{mon}"
+    current_year = now.year
+    current_month = now.month
+    expiry_month = int(MONTH_MAP[mon])
+
+    # CRITICAL YEAR ROLLOVER FIX
+    if expiry_month < current_month:
+        expiry_year = current_year + 1
+    else:
+        expiry_year = current_year
 
     return {
-        "date_param": date_param,
-        "symbol_expiry": symbol_expiry
+        "date_param": f"{expiry_year}-{MONTH_MAP[mon]}-{day.zfill(2)}",
+        "symbol_expiry": f"{str(expiry_year)[-2:]}{mon}"
     }
 
 # =====================================================
@@ -102,13 +112,16 @@ html = fetch_html_with_retry(BASE_URL)
 soup = BeautifulSoup(html, "html.parser")
 texts = [el.get_text(strip=True) for el in soup.select(".bodyBaseHeavy")]
 
+if not texts:
+    raise RuntimeError("❌ No text extracted from base page")
+
 # =====================================================
-# STEP 2: EXTRACT EXPIRY DATES (e.g. 30 Dec, 06 Jan)
+# STEP 2: EXTRACT EXPIRY LABELS (30 Dec, 06 Jan, etc.)
 # =====================================================
-expiry_texts = []
-for t in texts:
-    if re.fullmatch(r"\d{2}\s[A-Za-z]{3}", t):
-        expiry_texts.append(t)
+expiry_texts = [
+    t for t in texts
+    if re.fullmatch(r"\d{2}\s[A-Za-z]{3}", t)
+]
 
 expiry_texts = list(dict.fromkeys(expiry_texts))  # unique, ordered
 
@@ -125,13 +138,13 @@ db = client[DB_NAME]
 collection = db[COLLECTION_NAME]
 
 trade_date = datetime.utcnow().strftime("%Y-%m-%d")
-year = datetime.utcnow().year
+now = datetime.utcnow()
 
 # =====================================================
 # STEP 4: PROCESS EACH EXPIRY
 # =====================================================
 for exp_text in expiry_texts:
-    exp = expiry_text_to_date(exp_text, year)
+    exp = expiry_text_to_date(exp_text, now)
 
     expiry_url = f"{BASE_URL}?expiry={exp['date_param']}"
     print(f"\n[▶] Processing expiry {exp_text} → {expiry_url}")
