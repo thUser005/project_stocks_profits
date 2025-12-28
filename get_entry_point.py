@@ -5,7 +5,7 @@ import time
 from bs4 import BeautifulSoup
 from typing import List
 from pymongo import MongoClient, errors
-from datetime import datetime
+from datetime import datetime, timezone
 
 # =====================================================
 # CONFIG
@@ -82,19 +82,17 @@ def build_symbol(symbol: str, expiry: str, strike: str, opt_type: str) -> str:
 
 def expiry_text_to_date(text: str, now: datetime) -> dict:
     """
-    Correctly handles year rollover.
-    Example (today = Dec 2025):
-      '30 Dec' -> 2025-12-30
-      '06 Jan' -> 2026-01-06
+    Handles year rollover correctly.
+    Ignores DTE values.
     """
     day, mon = text.split()
     mon = mon.upper()
 
+    expiry_month = int(MONTH_MAP[mon])
     current_year = now.year
     current_month = now.month
-    expiry_month = int(MONTH_MAP[mon])
 
-    # CRITICAL YEAR ROLLOVER FIX
+    # YEAR ROLLOVER FIX
     if expiry_month < current_month:
         expiry_year = current_year + 1
     else:
@@ -112,18 +110,15 @@ html = fetch_html_with_retry(BASE_URL)
 soup = BeautifulSoup(html, "html.parser")
 texts = [el.get_text(strip=True) for el in soup.select(".bodyBaseHeavy")]
 
-if not texts:
-    raise RuntimeError("❌ No text extracted from base page")
-
 # =====================================================
-# STEP 2: EXTRACT EXPIRY LABELS (30 Dec, 06 Jan, etc.)
+# STEP 2: EXTRACT ONLY REAL EXPIRY DATES (FILTER DTE)
 # =====================================================
 expiry_texts = [
     t for t in texts
     if re.fullmatch(r"\d{2}\s[A-Za-z]{3}", t)
 ]
 
-expiry_texts = list(dict.fromkeys(expiry_texts))  # unique, ordered
+expiry_texts = list(dict.fromkeys(expiry_texts))
 
 if not expiry_texts:
     raise RuntimeError("❌ No expiry dates found")
@@ -137,8 +132,8 @@ client = connect_mongo_with_retry()
 db = client[DB_NAME]
 collection = db[COLLECTION_NAME]
 
-trade_date = datetime.utcnow().strftime("%Y-%m-%d")
-now = datetime.utcnow()
+now = datetime.now(timezone.utc)
+trade_date = now.strftime("%Y-%m-%d")
 
 # =====================================================
 # STEP 4: PROCESS EACH EXPIRY
@@ -183,10 +178,10 @@ for exp_text in expiry_texts:
     update_doc = {
         "$set": {
             "symbols": symbols,
-            "updated_at": datetime.utcnow(),
+            "updated_at": now,
         },
         "$setOnInsert": {
-            "created_at": datetime.utcnow(),
+            "created_at": now,
         },
     }
 
