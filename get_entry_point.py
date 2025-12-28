@@ -11,18 +11,24 @@ from datetime import datetime, timezone
 # =====================================================
 # CONFIG
 # =====================================================
-UNDERLYING = "NIFTY"
-BASE_URL = "https://groww.in/options/nifty"
+UNDERLYINGS = {
+    "NIFTY": "https://groww.in/options/nifty",
+    "BANKNIFTY": "https://groww.in/options/nifty-bank",
+    "SENSEX": "https://groww.in/options/sp-bse-sensex",
+    "FINNIFTY": "https://groww.in/options/nifty-financial-services",
+    "MIDCPNIFTY": "https://groww.in/options/nifty-midcap-select",
+    "BANKEX": "https://groww.in/options/sp-bse-bankex",
+}
 
 MAX_RETRIES = 3
-RETRY_DELAY = 2  # seconds
+RETRY_DELAY = 2
 
+# MongoDB
 keys_data = None
 if os.path.exists("keys.json"):
     with open("keys.json") as f:
         keys_data = json.load(f)
 
-# MongoDB
 MONGO_URL = os.getenv("MONGO_URL", keys_data["mongo_url"] if keys_data else None)
 DB_NAME = "options_data"
 COLLECTION_NAME = "nifty_symbols"
@@ -56,29 +62,27 @@ VALID_MONTHS = set(MONTH_MAP.keys())
 # HELPERS
 # =====================================================
 def fetch_html_with_retry(url: str) -> str:
-    for attempt in range(1, MAX_RETRIES + 1):
+    for i in range(MAX_RETRIES):
         try:
-            print(f"[+] Fetch attempt {attempt}: {url}")
+            print(f"[+] Fetch: {url}")
             r = requests.get(url, headers=HEADERS_HTML, timeout=15)
             r.raise_for_status()
             return r.text
-        except requests.RequestException as e:
-            print(f"[⚠️] Fetch failed: {e}")
-            if attempt == MAX_RETRIES:
+        except requests.RequestException:
+            if i == MAX_RETRIES - 1:
                 raise
             time.sleep(RETRY_DELAY)
 
 
 def connect_mongo_with_retry() -> MongoClient:
-    for attempt in range(1, MAX_RETRIES + 1):
+    for i in range(MAX_RETRIES):
         try:
-            print(f"[+] MongoDB connect attempt {attempt}")
+            print("[+] MongoDB connect")
             client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
             client.admin.command("ping")
             return client
-        except errors.PyMongoError as e:
-            print(f"[⚠️] MongoDB error: {e}")
-            if attempt == MAX_RETRIES:
+        except errors.PyMongoError:
+            if i == MAX_RETRIES - 1:
                 raise
             time.sleep(RETRY_DELAY)
 
@@ -87,8 +91,8 @@ def normalize_strike(text: str) -> str:
     return text.replace(",", "")
 
 
-def build_symbol(underlying: str, expiry: str, strike: str, opt_type: str) -> str:
-    return f"{underlying}{expiry}{strike}{opt_type}"
+def build_symbol(underlying: str, expiry: str, strike: str) -> str:
+    return f"{underlying}{expiry}{strike}CE"
 
 
 def expiry_text_to_date(text: str, now: datetime) -> Optional[Dict[str, str]]:
@@ -110,17 +114,17 @@ def expiry_text_to_date(text: str, now: datetime) -> Optional[Dict[str, str]]:
     return {
         "date_param": full_date,
         "symbol_expiry": f"{str(expiry_year)[-2:]}{mon}",
-        "expiry_key": full_date,   # 🔥 UNIQUE KEY
+        "expiry_key": full_date,
     }
 
 
 def extract_body_texts(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
-    return [el.get_text(strip=True) for el in soup.select(".bodyBaseHeavy")]
+    return [e.get_text(strip=True) for e in soup.select(".bodyBaseHeavy")]
 
 
-def extract_expiry_texts() -> List[str]:
-    html = fetch_html_with_retry(BASE_URL)
+def extract_expiry_texts(base_url: str) -> List[str]:
+    html = fetch_html_with_retry(base_url)
     texts = extract_body_texts(html)
     return list(dict.fromkeys(texts))
 
@@ -128,60 +132,56 @@ def extract_expiry_texts() -> List[str]:
 def extract_strikes(expiry_url: str) -> List[str]:
     html = fetch_html_with_retry(expiry_url)
     texts = extract_body_texts(html)
-
-    strikes = [
-        normalize_strike(t)
-        for t in texts
-        if re.fullmatch(r"\d{1,3}(,\d{3})+", t)
-    ]
-
-    return sorted(set(strikes), key=int)
+    return sorted(
+        {normalize_strike(t) for t in texts if re.fullmatch(r"\d{1,3}(,\d{3})+", t)},
+        key=int
+    )
 
 # =====================================================
 # CORE
 # =====================================================
-def process_expiries():
+def process_all_underlyings():
     now = datetime.now(timezone.utc)
     trade_date = now.strftime("%Y-%m-%d")
 
     client = connect_mongo_with_retry()
-    db = client[DB_NAME]
-    collection = db[COLLECTION_NAME]
+    collection = client[DB_NAME][COLLECTION_NAME]
 
-    raw_expiries = extract_expiry_texts()
-    print(f"[+] Found raw expiries: {raw_expiries}")
+    final_data: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
 
-    all_data: Dict[str, Dict[str, List[str]]] = {}
+    for underlying, base_url in UNDERLYINGS.items():
+        print(f"\n===== PROCESSING {underlying} =====")
+        final_data[underlying] = {}
 
-    for exp_text in raw_expiries:
-        exp = expiry_text_to_date(exp_text, now)
-        if not exp:
-            continue
+        raw_expiries = extract_expiry_texts(base_url)
 
-        expiry_url = f"{BASE_URL}?expiry={exp['date_param']}"
-        print(f"\n[▶] Processing {exp_text} → {expiry_url}")
+        for exp_text in raw_expiries:
+            exp = expiry_text_to_date(exp_text, now)
+            if not exp:
+                continue
 
-        strikes = extract_strikes(expiry_url)
-        if not strikes:
-            continue
+            expiry_url = f"{base_url}?expiry={exp['date_param']}"
+            strikes = extract_strikes(expiry_url)
+            if not strikes:
+                continue
 
-        symbols = [
-            build_symbol(UNDERLYING, exp["symbol_expiry"], strike, "CE")
-            for strike in strikes
-        ]
+            symbols = [
+                build_symbol(underlying, exp["symbol_expiry"], s)
+                for s in strikes
+            ]
 
-        all_data[exp["expiry_key"]] = {
-            "symbol_expiry": exp["symbol_expiry"],
-            "symbols": symbols
-        }
+            final_data[underlying][exp["expiry_key"]] = {
+                "symbol_expiry": exp["symbol_expiry"],
+                "symbols": symbols
+            }
 
-        print(f"[✓] Collected {len(symbols)} symbols for {exp['expiry_key']}")
+            print(f"[✓] {underlying} {exp['expiry_key']} → {len(symbols)} symbols")
 
     collection.update_one(
-        {"underlying": UNDERLYING, "trade_date": trade_date},
+        {"trade_date": trade_date},
         {
             "$set": {
-                "data": all_data,
+                "data": final_data,
                 "updated_at": now,
             },
             "$setOnInsert": {
@@ -192,11 +192,11 @@ def process_expiries():
     )
 
     client.close()
-    print("\n[✅] All expiries saved correctly (NO OVERWRITE)")
+    print("\n[✅] ALL underlyings saved in ONE MongoDB document")
 
 
 # =====================================================
 # ENTRY POINT
 # =====================================================
 if __name__ == "__main__":
-    process_expiries()
+    process_all_underlyings()
