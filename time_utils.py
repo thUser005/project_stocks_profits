@@ -6,6 +6,14 @@ MARKET_OPEN = time(9, 15)
 MARKET_CLOSE = time(15, 30)
 
 
+def is_market_time():
+    """
+    Returns True if current IST time is within market hours
+    """
+    now = datetime.now(IST).time()
+    return MARKET_OPEN <= now <= MARKET_CLOSE
+
+
 def market_window_for_date(date_str):
     """
     Returns (start_ms, end_ms) for market hours of a given date (IST)
