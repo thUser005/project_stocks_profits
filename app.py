@@ -6,8 +6,15 @@ import subprocess
 import re
 import time
 import urllib.request
+import signal
 from flask import Flask, jsonify, request
 from flask_compress import Compress
+
+# =====================================================
+# CONFIG
+# =====================================================
+FLASK_PORT = 5000
+CLOUDFLARED_BIN = "./cloudflared"
 
 # =====================================================
 # AUTO-INSTALL REQUIRED PYTHON PACKAGES
@@ -31,6 +38,35 @@ for p in ["flask", "flask-compress", "requests", "aiohttp"]:
 from test_runner import run_test_for_date
 from worker import run_worker
 from telegram_msg import send_message
+
+# =====================================================
+# PORT MANAGEMENT (🔥 NEW)
+# =====================================================
+def kill_process_using_port(port):
+    """
+    Kill any process currently using the given port.
+    Linux-safe. Required for single-instance workers.
+    """
+    try:
+        result = subprocess.check_output(
+            ["lsof", "-ti", f":{port}"],
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+
+        if not result:
+            return
+
+        pids = result.split("\n")
+        for pid in pids:
+            print(f"🔪 Killing process {pid} using port {port}")
+            os.kill(int(pid), signal.SIGKILL)
+
+        time.sleep(1)
+
+    except subprocess.CalledProcessError:
+        # No process using the port
+        pass
+
 
 # =====================================================
 # FLASK APP
@@ -57,18 +93,16 @@ def test_candles():
     if not date:
         return jsonify({"error": "date=YYYY-MM-DD required"}), 400
 
-    # isolated loop per request (SAFE)
     result = asyncio.run(run_test_for_date(date))
     return jsonify(result)
 
 
 # =====================================================
-# WORKER THREAD (ASYNC LOOP)
+# WORKER THREAD
 # =====================================================
 def start_worker():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
 
     try:
         loop.run_until_complete(run_worker())
@@ -78,11 +112,8 @@ def start_worker():
 
 
 # =====================================================
-# CLOUDFLARED SETUP
+# CLOUDFLARED
 # =====================================================
-CLOUDFLARED_BIN = "./cloudflared"
-
-
 def ensure_cloudflared():
     if os.path.exists(CLOUDFLARED_BIN):
         return
@@ -116,11 +147,7 @@ def start_cloudflare_tunnel(port):
         match = re.search(r"https://[a-zA-Z0-9\-]+\.trycloudflare\.com", line)
         if match:
             public_url = match.group(0)
-
             test_url = f"{public_url}/test/candles?date=2025-12-31"
-
-            print("\n✅ PUBLIC URL:")
-            print(public_url)
 
             send_message(
                 "🚀 *Dedicated Worker Server Started*\n\n"
@@ -129,7 +156,6 @@ def start_cloudflare_tunnel(port):
                 f"🧪 Test: {test_url}\n\n"
                 "✅ API + Worker + Tunnel are LIVE"
             )
-
             break
 
 
@@ -139,7 +165,7 @@ def start_cloudflare_tunnel(port):
 def start_flask():
     app.run(
         host="0.0.0.0",
-        port=5000,
+        port=FLASK_PORT,
         debug=False,
         threaded=True,
         use_reloader=False
@@ -151,6 +177,9 @@ def start_flask():
 # =====================================================
 def main():
     print("🚀 Starting Dedicated Server...")
+
+    # 🔥 KILL OLD INSTANCE USING SAME PORT
+    kill_process_using_port(FLASK_PORT)
 
     # -------------------------------
     # Start Flask
@@ -175,7 +204,7 @@ def main():
     # -------------------------------
     # Start Cloudflare Tunnel
     # -------------------------------
-    start_cloudflare_tunnel(5000)
+    start_cloudflare_tunnel(FLASK_PORT)
 
     # -------------------------------
     # Keep alive
