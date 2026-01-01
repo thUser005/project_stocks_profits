@@ -6,14 +6,16 @@ import subprocess
 import re
 import time
 import urllib.request
-import signal
+import socket
 from flask import Flask, jsonify, request
 from flask_compress import Compress
 
 # =====================================================
 # CONFIG
 # =====================================================
-FLASK_PORT = 5000
+BASE_PORT = 5000
+MAX_PORT_TRIES = 20
+PID_FILE = "/tmp/project_worker.pid"
 CLOUDFLARED_BIN = "./cloudflared"
 
 # =====================================================
@@ -40,58 +42,47 @@ from worker import run_worker
 from telegram_msg import send_message
 
 # =====================================================
-# 🔍 PORT INSPECTION (MANUAL)
+# PORT + PROCESS HELPERS (SAFE)
 # =====================================================
-def list_ports_in_use():
-    print("\n🔍 Checking ports currently in use...\n")
+def is_process_alive(pid: int) -> bool:
     try:
-        output = subprocess.check_output(
-            ["lsof", "-i", "-P", "-n"],
-            stderr=subprocess.DEVNULL
-        ).decode()
-        print(output)
-        return output
-    except Exception as e:
-        print("⚠️ Unable to list ports:", e)
-        return None
-
-
-def ask_and_kill_port(port):
-    """
-    Ask user before killing any process using the port.
-    """
-    try:
-        result = subprocess.check_output(
-            ["lsof", "-ti", f":{port}"],
-            stderr=subprocess.DEVNULL
-        ).decode().strip()
-
-        if not result:
-            print(f"✅ Port {port} is free")
-            return True
-
-        pids = result.split("\n")
-
-        print(f"\n⚠️ Port {port} is currently in use by PID(s): {pids}")
-        ans = input(f"❓ Do you want to STOP these process(es) on port {port}? (yes/no): ").strip().lower()
-
-        if ans != "yes":
-            print("🚫 User chose NOT to stop existing process.")
-            return False
-
-        for pid in pids:
-            try:
-                print(f"🔪 Killing PID {pid}")
-                os.kill(int(pid), signal.SIGKILL)
-            except Exception as e:
-                print(f"❌ Failed to kill PID {pid}: {e}")
-
-        time.sleep(1)
+        os.kill(pid, 0)
         return True
+    except Exception:
+        return False
 
-    except subprocess.CalledProcessError:
-        print(f"✅ Port {port} is free")
-        return True
+
+def is_port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("127.0.0.1", port)) != 0
+
+
+def pick_free_port(base: int) -> int:
+    for i in range(MAX_PORT_TRIES):
+        port = base + i
+        if is_port_free(port):
+            return port
+    raise RuntimeError("❌ No free port available")
+
+# =====================================================
+# PID LOCK (OWN PROCESS ONLY)
+# =====================================================
+def acquire_pid_lock():
+    if os.path.exists(PID_FILE):
+        with open(PID_FILE) as f:
+            old_pid = int(f.read().strip())
+
+        if is_process_alive(old_pid):
+            print(f"⚠️ App already running with PID {old_pid}")
+            print("➡️ Reusing existing instance. Exiting.")
+            sys.exit(0)
+        else:
+            print("🧹 Removing stale PID file")
+            os.remove(PID_FILE)
+
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
 
 # =====================================================
 # FLASK APP
@@ -110,10 +101,6 @@ def health():
 
 @app.route("/test/candles", methods=["GET"])
 def test_candles():
-    """
-    Example:
-    /test/candles?date=2025-12-31
-    """
     date = request.args.get("date")
     if not date:
         return jsonify({"error": "date=YYYY-MM-DD required"}), 400
@@ -184,11 +171,11 @@ def start_cloudflare_tunnel(port):
 # =====================================================
 # FLASK THREAD
 # =====================================================
-def start_flask():
-    print(f"🚀 Flask starting on port {FLASK_PORT}")
+def start_flask(port):
+    print(f"🚀 Flask starting on port {port}")
     app.run(
         host="0.0.0.0",
-        port=FLASK_PORT,
+        port=port,
         debug=False,
         threaded=True,
         use_reloader=False
@@ -198,22 +185,21 @@ def start_flask():
 # MAIN
 # =====================================================
 def main():
-    print("🚀 Starting Dedicated Server (Manual Port Control)...")
+    print("🚀 Starting Dedicated Server (SAFE MODE)...")
 
-    # 🔍 Show all ports
-    list_ports_in_use()
+    # 🔐 Ensure single instance of OUR app
+    acquire_pid_lock()
 
-    # ❓ Ask before killing port
-    ok = ask_and_kill_port(FLASK_PORT)
-    if not ok:
-        print("❌ Server start aborted by user.")
-        return
+    # 🔁 Pick free port automatically
+    port = pick_free_port(BASE_PORT)
+    print(f"✅ Using port {port}")
 
     # -------------------------------
     # Start Flask
     # -------------------------------
     threading.Thread(
         target=start_flask,
+        args=(port,),
         daemon=True
     ).start()
 
@@ -232,7 +218,7 @@ def main():
     # -------------------------------
     # Start Cloudflare Tunnel
     # -------------------------------
-    start_cloudflare_tunnel(FLASK_PORT)
+    start_cloudflare_tunnel(port)
 
     # -------------------------------
     # Keep alive
