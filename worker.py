@@ -253,7 +253,7 @@ def run_cold_start_from_api():
     send_table_images("TARGET HIT", exited.get("1_profit", {}))
     send_table_images("STOPLOSS HIT", exited.get("2_stoploss", {}))
     send_table_images("ENTERED", entered)
-    send_table_images("NOT ENTERED", not_entered)
+    # send_table_images("NOT ENTERED", not_entered)
 
     cold_start_done = True
     log("COLD_START_DONE")
