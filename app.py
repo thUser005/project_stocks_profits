@@ -40,12 +40,25 @@ from worker import run_worker
 from telegram_msg import send_message
 
 # =====================================================
-# PORT MANAGEMENT (🔥 NEW)
+# 🔍 PORT INSPECTION (MANUAL)
 # =====================================================
-def kill_process_using_port(port):
+def list_ports_in_use():
+    print("\n🔍 Checking ports currently in use...\n")
+    try:
+        output = subprocess.check_output(
+            ["lsof", "-i", "-P", "-n"],
+            stderr=subprocess.DEVNULL
+        ).decode()
+        print(output)
+        return output
+    except Exception as e:
+        print("⚠️ Unable to list ports:", e)
+        return None
+
+
+def ask_and_kill_port(port):
     """
-    Kill any process currently using the given port.
-    Linux-safe. Required for single-instance workers.
+    Ask user before killing any process using the port.
     """
     try:
         result = subprocess.check_output(
@@ -54,19 +67,31 @@ def kill_process_using_port(port):
         ).decode().strip()
 
         if not result:
-            return
+            print(f"✅ Port {port} is free")
+            return True
 
         pids = result.split("\n")
+
+        print(f"\n⚠️ Port {port} is currently in use by PID(s): {pids}")
+        ans = input(f"❓ Do you want to STOP these process(es) on port {port}? (yes/no): ").strip().lower()
+
+        if ans != "yes":
+            print("🚫 User chose NOT to stop existing process.")
+            return False
+
         for pid in pids:
-            print(f"🔪 Killing process {pid} using port {port}")
-            os.kill(int(pid), signal.SIGKILL)
+            try:
+                print(f"🔪 Killing PID {pid}")
+                os.kill(int(pid), signal.SIGKILL)
+            except Exception as e:
+                print(f"❌ Failed to kill PID {pid}: {e}")
 
         time.sleep(1)
+        return True
 
     except subprocess.CalledProcessError:
-        # No process using the port
-        pass
-
+        print(f"✅ Port {port} is free")
+        return True
 
 # =====================================================
 # FLASK APP
@@ -96,7 +121,6 @@ def test_candles():
     result = asyncio.run(run_test_for_date(date))
     return jsonify(result)
 
-
 # =====================================================
 # WORKER THREAD
 # =====================================================
@@ -109,7 +133,6 @@ def start_worker():
     except Exception as e:
         send_message(f"🔴 Worker crashed:\n{e}")
         raise
-
 
 # =====================================================
 # CLOUDFLARED
@@ -158,11 +181,11 @@ def start_cloudflare_tunnel(port):
             )
             break
 
-
 # =====================================================
 # FLASK THREAD
 # =====================================================
 def start_flask():
+    print(f"🚀 Flask starting on port {FLASK_PORT}")
     app.run(
         host="0.0.0.0",
         port=FLASK_PORT,
@@ -171,15 +194,20 @@ def start_flask():
         use_reloader=False
     )
 
-
 # =====================================================
 # MAIN
 # =====================================================
 def main():
-    print("🚀 Starting Dedicated Server...")
+    print("🚀 Starting Dedicated Server (Manual Port Control)...")
 
-    # 🔥 KILL OLD INSTANCE USING SAME PORT
-    kill_process_using_port(FLASK_PORT)
+    # 🔍 Show all ports
+    list_ports_in_use()
+
+    # ❓ Ask before killing port
+    ok = ask_and_kill_port(FLASK_PORT)
+    if not ok:
+        print("❌ Server start aborted by user.")
+        return
 
     # -------------------------------
     # Start Flask
@@ -189,7 +217,7 @@ def main():
         daemon=True
     ).start()
 
-    time.sleep(2)
+    time.sleep(3)
 
     # -------------------------------
     # Start Worker
