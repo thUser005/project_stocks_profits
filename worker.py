@@ -69,7 +69,7 @@ def log(msg):
     print(f"[{now_str()}] {msg}", flush=True)
 
 # =====================================================
-# TELEGRAM (SAFE WRAPPER)
+# TELEGRAM
 # =====================================================
 def safe_send_message(text=None, photo=None, caption=None):
     try:
@@ -82,7 +82,15 @@ def safe_send_message(text=None, photo=None, caption=None):
         log(f"TELEGRAM_SEND_FAILED :: {e}")
 
 # =====================================================
-# SUMMARY PIE IMAGE (COUNT + %)
+# HELPERS (FORMAT ONLY)
+# =====================================================
+def fmt_price(v):
+    if v is None:
+        return ""
+    return f"{v:.2f}".replace(".", "-")
+
+# =====================================================
+# SUMMARY PIE IMAGE (UNCHANGED)
 # =====================================================
 def send_summary_pie(target, sl, entered, not_entered):
     labels_raw = [
@@ -111,15 +119,11 @@ def send_summary_pie(target, sl, entered, not_entered):
     plt.savefig(tmp.name, bbox_inches="tight")
     plt.close(fig)
 
-    safe_send_message(
-        photo=tmp.name,
-        caption=f"📊 Cold Start Summary\n⏱ {now_str()}",
-    )
-
+    safe_send_message(photo=tmp.name, caption=f"📊 Cold Start Summary\n⏱ {now_str()}")
     os.unlink(tmp.name)
 
 # =====================================================
-# META SUMMARY TEXT (NEW)
+# META SUMMARY TEXT (UNCHANGED)
 # =====================================================
 def send_meta_summary_text(meta):
     if not meta:
@@ -144,7 +148,7 @@ def send_meta_summary_text(meta):
     safe_send_message(text=msg)
 
 # =====================================================
-# TABLE IMAGE (UNCHANGED)
+# TABLE IMAGE (MODIFIED VISUALS ONLY)
 # =====================================================
 def send_table_images(title, bucket):
     if not bucket:
@@ -156,57 +160,90 @@ def send_table_images(title, bucket):
     for page in range(total_pages):
         chunk = items[page * ROWS_PER_IMAGE:(page + 1) * ROWS_PER_IMAGE]
 
-        col_headers = ["Logo", "Symbol", "Entry", "Exit", "Qty", "PnL"]
-        col_widths = [60, 140, 230, 230, 80, 120]
+        col_headers = [
+            "Logo", "Symbol",
+            "Entry Px", "Entry Time",
+            "Exit Px", "Exit Time",
+            "Qty", "PnL",
+            "SL", "Target", "Open"
+        ]
 
-        row_h = 42
-        header_h = 48
-        pad = 20
+        col_widths = [
+            50, 120,
+            110, 90,
+            110, 90,
+            60, 90,
+            90, 90, 90
+        ]
+
+        row_h = 38
+        header_h = 44
+        pad = 15
 
         width = sum(col_widths) + pad * 2
-        height = header_h + row_h * (len(chunk) + 1) + pad * 2
+        height = header_h + row_h * len(chunk) + pad * 2
 
         img = Image.new("RGB", (width, height), "white")
         draw = ImageDraw.Draw(img)
 
         try:
-            font = ImageFont.truetype("DejaVuSans.ttf", 18)
-            font_b = ImageFont.truetype("DejaVuSans-Bold.ttf", 20)
+            font = ImageFont.truetype("DejaVuSans.ttf", 15)
+            font_b = ImageFont.truetype("DejaVuSans-Bold.ttf", 16)
         except:
             font = font_b = ImageFont.load_default()
 
         draw.text((pad, 5), f"{title} (Page {page+1}/{total_pages})", font=font_b)
 
-        y = pad + 30
+        y = pad + 22
         x = pad
 
         for i, h in enumerate(col_headers):
             draw.rectangle([x, y, x + col_widths[i], y + header_h], fill="#eeeeee", outline="black")
-            draw.text((x + 6, y + 12), h, font=font_b)
+            draw.text((x + 4, y + 12), h, font=font_b)
             x += col_widths[i]
 
         y += header_h
 
         for sym, obj in chunk:
-            pnl = round(obj.get("pnl", 0) or 0, 2)
-            pnl_color = "#2ecc71" if pnl > 0 else "#e74c3c" if pnl < 0 else "#7f8c8d"
+            pnl = obj.get("pnl", 0) or 0
+            pnl_bg = "#d4edda" if pnl > 0 else "#f8d7da" if pnl < 0 else "white"
 
             x = pad
+
             draw.rectangle([x, y, x + col_widths[0], y + row_h], outline="black")
-            draw.ellipse([x+20, y+10, x+40, y+30], fill="#3498db")
+            draw.ellipse([x+15, y+10, x+35, y+30], fill="#3498db")
             x += col_widths[0]
 
             cells = [
                 obj.get("symbol", sym),
-                f"{obj.get('entry')} @ {obj.get('entry_time')}",
-                f"{obj.get('exit_ltp')} @ {obj.get('exit_time')}",
+                fmt_price(obj.get("entry")),
+                obj.get("entry_time", ""),
+                fmt_price(obj.get("exit_ltp")),
+                obj.get("exit_time", ""),
                 str(obj.get("qty", "")),
-                f"₹{pnl}",
+                fmt_price(pnl),
+                fmt_price(obj.get("stoploss")),
+                fmt_price(obj.get("target")),
+                fmt_price(obj.get("open")),
+            ]
+
+            bg_colors = [
+                "white",
+                "#e3f2fd",
+                "white",
+                "#e8f5e9",
+                "white",
+                "white",
+                pnl_bg,
+                "#fdecea",
+                "#e8f5e9",
+                "#f2f2f2",
             ]
 
             for i, cell in enumerate(cells):
-                draw.rectangle([x, y, x + col_widths[i+1], y + row_h], outline="black")
-                draw.text((x + 6, y + 10), cell, fill=pnl_color if i == 4 else "black")
+                draw.rectangle([x, y, x + col_widths[i+1], y + row_h],
+                               fill=bg_colors[i], outline="black")
+                draw.text((x + 4, y + 10), str(cell), font=font)
                 x += col_widths[i+1]
 
             y += row_h
@@ -218,7 +255,7 @@ def send_table_images(title, bucket):
         os.unlink(tmp.name)
 
 # =====================================================
-# ANALYZED API MERGE (META PRESERVED)
+# ANALYZED API MERGE (UNCHANGED)
 # =====================================================
 def trade_uid(obj):
     return f"{obj['symbol']}|{obj['entry_time']}|{obj['exit_time']}"
@@ -238,7 +275,7 @@ def fetch_and_merge_analyzed():
         )
 
         payload = r.json()
-        meta = meta or payload  # keep first meta
+        meta = meta or payload
 
         for group, buckets in payload.get("the_data", {}).items():
             merged.setdefault(group, {})
@@ -251,7 +288,7 @@ def fetch_and_merge_analyzed():
     return merged, meta
 
 # =====================================================
-# COLD START
+# COLD START (UNCHANGED)
 # =====================================================
 def run_cold_start_from_api():
     global cold_start_done
@@ -298,7 +335,9 @@ async def run_worker():
                     continue
 
                 if not cold_start_task_started:
-                    asyncio.get_running_loop().run_in_executor(None, run_cold_start_from_api)
+                    asyncio.get_running_loop().run_in_executor(
+                        None, run_cold_start_from_api
+                    )
                     cold_start_task_started = True
 
                 await asyncio.sleep(SLEEP_INTERVAL)
