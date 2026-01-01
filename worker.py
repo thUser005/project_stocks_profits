@@ -1,5 +1,6 @@
 import asyncio
 import aiohttp
+import time
 from datetime import datetime, timedelta, timezone, time as dtime
 
 from companies import load_companies
@@ -19,6 +20,10 @@ SLEEP_INTERVAL = 1
 ERROR_SLEEP = 15
 MAX_RETRIES = 3
 SUMMARY_INTERVAL = 600
+
+# 🔥 Cold start progress config (NEW)
+COLD_PROGRESS_EVERY_SYMBOLS = 10
+COLD_PROGRESS_EVERY_SECONDS = 15
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -48,9 +53,10 @@ stats = {
 
 last_summary_ts = 0
 
-# 🔥 COLD START STATE (NEW)
+# 🔥 COLD START STATE
 cold_start_done = False
 cold_start_events = []
+cold_start_last_progress_ts = 0
 
 
 # =====================================================
@@ -100,6 +106,9 @@ def maybe_reset_alerts():
 def maybe_send_summary():
     global last_summary_ts
 
+    if not cold_start_done:
+        return
+
     now_ts = datetime.now(IST).timestamp()
     if now_ts - last_summary_ts < SUMMARY_INTERVAL:
         return
@@ -142,7 +151,7 @@ async def calculate_sell_setup(session, symbol):
 
 
 # =====================================================
-# SAFE FETCH (UNCHANGED)
+# SAFE FETCH
 # =====================================================
 async def fetch_latest_safe(semaphore, session, symbol):
     async with semaphore:
@@ -156,7 +165,7 @@ async def fetch_latest_safe(semaphore, session, symbol):
 
 
 # =====================================================
-# 🔥 COLD START REPLAY (NEW)
+# 🔥 COLD START REPLAY
 # =====================================================
 async def replay_symbol(session, sym, signal):
     events = []
@@ -171,7 +180,6 @@ async def replay_symbol(session, sym, signal):
     if not candles:
         return events
 
-    # ---- BUY REPLAY ----
     buy_state = "PENDING"
 
     for c in candles:
@@ -191,12 +199,11 @@ async def replay_symbol(session, sym, signal):
                 events.append((ts, sym, "BUY SL HIT", signal["stoploss"]))
                 break
 
-    # ---- SELL REPLAY ----
     setup = await calculate_sell_setup(session, sym)
     if not setup:
         return events
 
-    sell_state = "WAITING"
+    sell_state_local = "WAITING"
 
     for c in candles:
         ts = datetime.fromtimestamp(c[0] / 1000, IST)
@@ -205,11 +212,11 @@ async def replay_symbol(session, sym, signal):
         if ts.time() < SELL_START:
             continue
 
-        if sell_state == "WAITING" and low <= setup["entry"]:
-            sell_state = "ENTERED"
+        if sell_state_local == "WAITING" and low <= setup["entry"]:
+            sell_state_local = "ENTERED"
             events.append((ts, sym, "SELL ENTRY", setup["entry"]))
 
-        elif sell_state == "ENTERED":
+        elif sell_state_local == "ENTERED":
             if low <= setup["target"]:
                 events.append((ts, sym, "SELL TARGET HIT", setup["target"]))
                 break
@@ -241,7 +248,7 @@ def send_cold_start_summary(events):
 # WORKER
 # =====================================================
 async def run_worker():
-    global cold_start_done
+    global cold_start_done, cold_start_last_progress_ts
 
     timeout = aiohttp.ClientTimeout(total=15)
     connector = aiohttp.TCPConnector(limit=CONCURRENCY)
@@ -257,19 +264,49 @@ async def run_worker():
                     continue
 
                 maybe_reset_alerts()
-                maybe_send_summary()
 
                 signals = fetch_today_signals()
 
-                # 🔥 COLD START (RUN ONCE)
+                # 🔥 COLD START WITH PROGRESS
                 if not cold_start_done:
-                    send_message("⏪ Replaying trades since market open...")
+                    send_message("⏪ Cold start replay started…")
+
+                    total = len(signals)
+                    processed = 0
+                    detected = 0
+                    cold_start_last_progress_ts = time.time()
+
                     for s in signals:
-                        cold_start_events.extend(
-                            await replay_symbol(session, s["symbol"], s)
-                        )
+                        events = await replay_symbol(session, s["symbol"], s)
+                        cold_start_events.extend(events)
+
+                        processed += 1
+                        detected += len(events)
+
+                        now_ts = time.time()
+                        if (
+                            processed % COLD_PROGRESS_EVERY_SYMBOLS == 0
+                            or now_ts - cold_start_last_progress_ts >= COLD_PROGRESS_EVERY_SECONDS
+                        ):
+                            send_message(
+                                "⏳ *Cold start in progress…*\n\n"
+                                f"Processed : {processed} / {total}\n"
+                                f"Events    : {detected}\n"
+                                f"Time      : {now_str()}"
+                            )
+                            cold_start_last_progress_ts = now_ts
+
+                    send_message(
+                        "✅ *Cold start replay completed*\n\n"
+                        f"Total symbols : {total}\n"
+                        f"Total events  : {detected}\n"
+                        f"Completed at  : {now_str()}"
+                    )
+
                     send_cold_start_summary(cold_start_events)
                     cold_start_done = True
+
+                maybe_send_summary()
 
                 # ---------------- INIT ----------------
                 for s in signals:
@@ -296,7 +333,7 @@ async def run_worker():
 
                     ltp = candle[4]
 
-                    # ===== BUY =====
+                    # BUY
                     buy = trade_state.get(sym)
                     if buy:
                         s = buy["signal"]
@@ -304,7 +341,6 @@ async def run_worker():
                         if buy["state"] == "PENDING" and is_buy_time() and ltp >= s["entry"]:
                             buy["state"] = "ENTERED"
                             stats["entered"] += 1
-
                             send_trade_message("BUY ENTRY", {
                                 "Symbol": sym,
                                 "Entry": s["entry"],
@@ -331,7 +367,7 @@ async def run_worker():
                                     "Exit LTP": ltp,
                                 })
 
-                    # ===== SELL =====
+                    # SELL
                     sell = sell_state.get(sym)
                     if sell and is_sell_time():
 

@@ -69,7 +69,6 @@ def start_worker():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    send_message("🟢 Worker started successfully")
 
     try:
         loop.run_until_complete(run_worker())
