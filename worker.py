@@ -148,7 +148,7 @@ def send_meta_summary_text(meta):
     safe_send_message(text=msg)
 
 # =====================================================
-# TABLE IMAGE (MODIFIED VISUALS ONLY)
+# TABLE IMAGE (VISIBILITY FIX ONLY)
 # =====================================================
 def send_table_images(title, bucket):
     if not bucket:
@@ -176,8 +176,8 @@ def send_table_images(title, bucket):
             90, 90, 90
         ]
 
-        row_h = 38
-        header_h = 44
+        row_h = 40
+        header_h = 46
         pad = 15
 
         width = sum(col_widths) + pad * 2
@@ -187,19 +187,24 @@ def send_table_images(title, bucket):
         draw = ImageDraw.Draw(img)
 
         try:
-            font = ImageFont.truetype("DejaVuSans.ttf", 15)
-            font_b = ImageFont.truetype("DejaVuSans-Bold.ttf", 16)
+            font = ImageFont.truetype("DejaVuSans.ttf", 17)
+            font_b = ImageFont.truetype("DejaVuSans-Bold.ttf", 18)
         except:
             font = font_b = ImageFont.load_default()
 
-        draw.text((pad, 5), f"{title} (Page {page+1}/{total_pages})", font=font_b)
+        draw.text((pad, 5), f"{title} (Page {page+1}/{total_pages})",
+                  font=font_b, fill="#000000")
 
-        y = pad + 22
+        y = pad + 24
         x = pad
 
+        # HEADER
         for i, h in enumerate(col_headers):
-            draw.rectangle([x, y, x + col_widths[i], y + header_h], fill="#eeeeee", outline="black")
-            draw.text((x + 4, y + 12), h, font=font_b)
+            draw.rectangle(
+                [x, y, x + col_widths[i], y + header_h],
+                fill="#eeeeee", outline="black"
+            )
+            draw.text((x + 6, y + 13), h, font=font_b, fill="#000000")
             x += col_widths[i]
 
         y += header_h
@@ -241,9 +246,18 @@ def send_table_images(title, bucket):
             ]
 
             for i, cell in enumerate(cells):
-                draw.rectangle([x, y, x + col_widths[i+1], y + row_h],
-                               fill=bg_colors[i], outline="black")
-                draw.text((x + 4, y + 10), str(cell), font=font)
+                draw.rectangle(
+                    [x, y, x + col_widths[i+1], y + row_h],
+                    fill=bg_colors[i], outline="black"
+                )
+
+                draw.text(
+                    (x + 6, y + 11),
+                    str(cell),
+                    font=font_b if i in (1, 3, 6) else font,
+                    fill="#111111"
+                )
+
                 x += col_widths[i+1]
 
             y += row_h
