@@ -63,7 +63,6 @@ def now_str():
 def log(msg):
     print(f"[{now_str()}] {msg}", flush=True)
 
-
 # =====================================================
 # TELEGRAM
 # =====================================================
@@ -79,7 +78,6 @@ def send_trade_message(title, data: dict):
     for k, v in data.items():
         lines.append(f"{k:<14}: {v}")
     safe_send_message("\n".join(lines))
-
 
 # =====================================================
 # DAILY RESET
@@ -105,7 +103,9 @@ def maybe_reset_alerts():
         log("DAILY_RESET :: Trade state cleared")
         safe_send_message("🔄 Trade state reset for new trading day")
 
-
+# =====================================================
+# SUMMARY
+# =====================================================
 def maybe_send_summary():
     global last_summary_ts
 
@@ -173,9 +173,7 @@ def fetch_and_merge_analyzed():
             merged_data.setdefault(group, {})
             for bucket, symbols in buckets.items():
                 merged_data[group].setdefault(bucket, {})
-
                 for obj in symbols.values():
-                    # 🛡 HARD GUARD
                     if not isinstance(obj, dict):
                         continue
                     if (
@@ -192,7 +190,7 @@ def fetch_and_merge_analyzed():
     return merged_data
 
 # =====================================================
-# COLD START
+# COLD START (FULL BACKEND COVERAGE)
 # =====================================================
 def run_cold_start_from_api():
     global cold_start_done
@@ -209,47 +207,59 @@ def run_cold_start_from_api():
         return
 
     exited = data.get("1_exited", {})
+    entered = data.get("2_entered", {})
+    not_entered = data.get("3_not_entered", {})
+
     target_hits = exited.get("1_profit", {})
     sl_hits = exited.get("2_stoploss", {})
-    mc_hits = exited.get("3_market_closed", {})
 
     log(
         f"COLD_START_COUNTS :: "
-        f"target={len(target_hits)} sl={len(sl_hits)} mc={len(mc_hits)}"
+        f"target={len(target_hits)} "
+        f"sl={len(sl_hits)} "
+        f"entered={len(entered)} "
+        f"not_entered={len(not_entered)}"
     )
 
     safe_send_message(
         "📊 *COLD START SNAPSHOT*\n\n"
         f"🎯 Target Hit   : {len(target_hits)}\n"
         f"🛑 SL Hit       : {len(sl_hits)}\n"
-        f"🏁 Market Close : {len(mc_hits)}\n\n"
+        f"🟡 Entered     : {len(entered)}\n"
+        f"⚪ Not Entered : {len(not_entered)}\n\n"
         f"⏱ Snapshot @ {now_str()}"
     )
 
-    def send_exit_block(title, bucket):
+    def send_block(title, bucket, limit=20):
         if not bucket:
             return
 
         lines = [f"📉 *{title}* ({len(bucket)})\n"]
-        for obj in bucket.values():
+        for i, obj in enumerate(bucket.values()):
+            if i >= limit:
+                lines.append(f"...and {len(bucket) - limit} more")
+                break
+
             lines.append(
                 f"🔹 *{obj['symbol']}*\n"
-                f"Entry : {obj['entry']} @ {obj['entry_time']}\n"
-                f"Exit  : {obj['exit_ltp']} @ {obj['exit_time']}\n"
-                f"Qty   : {obj['qty']} | "
+                f"Entry : {obj.get('entry')} @ {obj.get('entry_time')}\n"
+                f"Exit  : {obj.get('exit_ltp')} @ {obj.get('exit_time')}\n"
+                f"Qty   : {obj.get('qty')} | "
                 f"PnL : ₹{round(obj.get('pnl', 0), 2)}\n"
             )
 
         safe_send_message("\n".join(lines))
 
-    send_exit_block("TARGET HIT", target_hits)
-    send_exit_block("STOPLOSS HIT", sl_hits)
+    send_block("TARGET HIT", target_hits)
+    send_block("STOPLOSS HIT", sl_hits)
+    send_block("ENTERED (OPEN / MARKET CLOSE)", entered)
+    send_block("NOT ENTERED", not_entered)
 
     cold_start_done = True
     log("COLD_START_DONE")
 
 # =====================================================
-# WORKER (UNCHANGED LOGIC)
+# WORKER (UNCHANGED)
 # =====================================================
 async def run_worker():
     global cold_start_task_started
