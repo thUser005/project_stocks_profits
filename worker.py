@@ -11,8 +11,8 @@ from time_utils import is_market_time
 # =====================================================
 # CONFIG
 # =====================================================
-CONCURRENCY = 12          # SAFE for Groww (do NOT exceed 15)
-BATCH_SIZE = 25           # how many symbols per gather
+CONCURRENCY = 50          # SAFE for Groww (do NOT exceed 15)
+BATCH_SIZE = 100           # how many symbols per gather
 SLEEP_INTERVAL = 30       # seconds between cycles
 ERROR_SLEEP = 15
 MAX_RETRIES = 3
