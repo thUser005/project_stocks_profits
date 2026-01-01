@@ -30,6 +30,7 @@ for p in ["flask", "flask-compress", "requests", "aiohttp"]:
 # IMPORT AFTER INSTALL
 # =====================================================
 from test_runner import run_test_for_date
+from telegram_msg import send_message   # ✅ ADD THIS
 
 # =====================================================
 # FLASK APP
@@ -97,14 +98,29 @@ def start_cloudflare_tunnel(port):
 
     for line in iter(process.stdout.readline, ""):
         print(line.strip())
+
         match = re.search(r"https://[a-zA-Z0-9\-]+\.trycloudflare\.com", line)
         if match:
             public_url = match.group(0)
+
             print("\n✅ PUBLIC URL:")
             print(public_url)
-            print(
-                f"\n🧪 TEST:\n{public_url}/test/candles?date=2025-12-31\n"
+
+            test_url = f"{public_url}/test/candles?date=2025-12-31"
+
+            print(f"\n🧪 TEST:\n{test_url}\n")
+
+            # =====================================================
+            # 📩 TELEGRAM NOTIFICATION (SERVER READY)
+            # =====================================================
+            send_message(
+                "🚀 *Candle Test Server Started*\n\n"
+                f"🌐 URL: {public_url}\n"
+                f"❤️ Health: {public_url}/\n"
+                f"🧪 Test: {test_url}\n\n"
+                "✅ Server is live and ready"
             )
+
             break
 
 
@@ -137,3 +153,5 @@ def main():
         time.sleep(60)
 
 
+if __name__ == "__main__":
+    main()
