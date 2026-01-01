@@ -50,26 +50,28 @@ stats = {
 }
 
 last_summary_ts = 0
-
 cold_start_done = False
 cold_start_task_started = False
 
 # =====================================================
-# HELPERS
+# LOGGING
 # =====================================================
 def now_str():
-    return datetime.now(IST).strftime("%H:%M:%S IST")
+    return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
 
 
 def log(msg):
-    print(f"[{now_str()}] {msg}")
+    print(f"[{now_str()}] {msg}", flush=True)
 
 
+# =====================================================
+# TELEGRAM
+# =====================================================
 def safe_send_message(text):
     try:
         send_message(text)
     except Exception as e:
-        log(f"❌ Telegram send failed: {e}")
+        log(f"TELEGRAM_SEND_FAILED :: {e}")
 
 
 def send_trade_message(title, data: dict):
@@ -100,8 +102,8 @@ def maybe_reset_alerts():
             "sl_hit": 0,
         })
 
+        log("DAILY_RESET :: Trade state cleared")
         safe_send_message("🔄 Trade state reset for new trading day")
-        log("Daily reset completed")
 
 
 def maybe_send_summary():
@@ -116,6 +118,7 @@ def maybe_send_summary():
 
     last_summary_ts = now_ts
 
+    log("SUMMARY_SENT :: 10-min summary")
     safe_send_message(
         "📊 *Trade Summary (10 min)*\n\n"
         f"🟢 Entered : {stats['entered']}\n"
@@ -135,67 +138,86 @@ async def fetch_latest_safe(semaphore, session, symbol):
                 _, candle = await fetch_latest_candle(session, symbol)
                 if candle:
                     return symbol, candle
-            except Exception:
+            except Exception as e:
+                log(f"CANDLE_FETCH_FAIL :: {symbol} :: {e}")
                 await asyncio.sleep(1)
         return symbol, None
 
 # =====================================================
-# 🔥 ANALYZED API MERGE (DEDUP SAFE)
+# ANALYZED API MERGE (DEDUP + SAFE)
 # =====================================================
 def trade_uid(obj):
     return f"{obj['symbol']}|{obj['entry_time']}|{obj['exit_time']}"
 
 
 def fetch_and_merge_analyzed():
-    now = datetime.now(IST)
-
     merged_data = {}
 
     for url in ANALYZED_APIS:
+        log(f"ANALYZED_FETCH_START :: {url}")
+
         r = requests.get(
             url,
             params={
-                "date": now.strftime("%Y-%m-%d"),
-                "end_before": now.strftime("%H:%M"),
+                "date": datetime.now(IST).strftime("%Y-%m-%d"),
+                "end_before": datetime.now(IST).strftime("%H:%M"),
             },
             timeout=30,
         )
         r.raise_for_status()
         payload = r.json()
 
+        log(f"ANALYZED_FETCH_OK :: {url}")
+
         for group, buckets in payload.get("the_data", {}).items():
             merged_data.setdefault(group, {})
             for bucket, symbols in buckets.items():
                 merged_data[group].setdefault(bucket, {})
+
                 for obj in symbols.values():
+                    # 🛡 HARD GUARD
+                    if not isinstance(obj, dict):
+                        continue
+                    if (
+                        "symbol" not in obj
+                        or "entry_time" not in obj
+                        or "exit_time" not in obj
+                    ):
+                        continue
+
                     uid = trade_uid(obj)
                     merged_data[group][bucket][uid] = obj
 
+    log("ANALYZED_MERGE_DONE")
     return merged_data
 
 # =====================================================
-# 🔥 COLD START (CLEAN OUTPUT)
+# COLD START
 # =====================================================
 def run_cold_start_from_api():
     global cold_start_done
 
-    log("Cold start started")
+    log("COLD_START_BEGIN")
     safe_send_message("⏪ Loading cold start snapshot…")
 
     try:
         data = fetch_and_merge_analyzed()
     except Exception as e:
+        log(f"COLD_START_FAILED :: {e}")
         safe_send_message(f"❌ Cold start failed:\n{e}")
         cold_start_done = True
         return
 
     exited = data.get("1_exited", {})
-
     target_hits = exited.get("1_profit", {})
-    sl_hits     = exited.get("2_stoploss", {})
-    mc_hits     = exited.get("3_market_closed", {})
+    sl_hits = exited.get("2_stoploss", {})
+    mc_hits = exited.get("3_market_closed", {})
 
-    # -------- SUMMARY --------
+    log(
+        f"COLD_START_COUNTS :: "
+        f"target={len(target_hits)} sl={len(sl_hits)} mc={len(mc_hits)}"
+    )
+
     safe_send_message(
         "📊 *COLD START SNAPSHOT*\n\n"
         f"🎯 Target Hit   : {len(target_hits)}\n"
@@ -204,13 +226,11 @@ def run_cold_start_from_api():
         f"⏱ Snapshot @ {now_str()}"
     )
 
-    # -------- DETAIL BLOCK --------
     def send_exit_block(title, bucket):
         if not bucket:
             return
 
         lines = [f"📉 *{title}* ({len(bucket)})\n"]
-
         for obj in bucket.values():
             lines.append(
                 f"🔹 *{obj['symbol']}*\n"
@@ -226,7 +246,7 @@ def run_cold_start_from_api():
     send_exit_block("STOPLOSS HIT", sl_hits)
 
     cold_start_done = True
-    log("Cold start completed")
+    log("COLD_START_DONE")
 
 # =====================================================
 # WORKER (UNCHANGED LOGIC)
@@ -234,25 +254,26 @@ def run_cold_start_from_api():
 async def run_worker():
     global cold_start_task_started
 
+    log("WORKER_START")
+    safe_send_message("🟢 Worker started")
+
     timeout = aiohttp.ClientTimeout(total=15)
     connector = aiohttp.TCPConnector(limit=CONCURRENCY)
     semaphore = asyncio.Semaphore(CONCURRENCY)
-
-    safe_send_message("🟢 Worker started")
-    log("Worker loop started")
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         while True:
             try:
                 if not is_market_time():
+                    log("MARKET_CLOSED :: sleeping")
                     await asyncio.sleep(60)
                     continue
 
                 maybe_reset_alerts()
-
                 signals = fetch_today_signals()
 
                 if not cold_start_task_started:
+                    log("COLD_START_TRIGGER")
                     asyncio.get_running_loop().run_in_executor(
                         None, run_cold_start_from_api
                     )
@@ -262,8 +283,7 @@ async def run_worker():
 
                 for s in signals:
                     sym = s["symbol"]
-                    if sym not in trade_state:
-                        trade_state[sym] = {"state": "PENDING", "signal": s}
+                    trade_state.setdefault(sym, {"state": "PENDING", "signal": s})
 
                 results = await asyncio.gather(*[
                     fetch_latest_safe(semaphore, session, sym)
@@ -276,9 +296,6 @@ async def run_worker():
 
                     ltp = candle[4]
                     buy = trade_state.get(sym)
-                    if not buy:
-                        continue
-
                     s = buy["signal"]
 
                     if (
@@ -288,6 +305,7 @@ async def run_worker():
                     ):
                         buy["state"] = "ENTERED"
                         stats["entered"] += 1
+                        log(f"BUY_ENTERED :: {sym} @ {ltp}")
                         send_trade_message("BUY ENTRY", {
                             "Symbol": sym,
                             "Entry": s["entry"],
@@ -300,6 +318,7 @@ async def run_worker():
                             buy["state"] = "EXITED"
                             stats["exited"] += 1
                             stats["target_hit"] += 1
+                            log(f"TARGET_HIT :: {sym} @ {ltp}")
                             send_trade_message("BUY TARGET HIT", {
                                 "Symbol": sym,
                                 "Exit LTP": ltp,
@@ -309,6 +328,7 @@ async def run_worker():
                             buy["state"] = "EXITED"
                             stats["exited"] += 1
                             stats["sl_hit"] += 1
+                            log(f"SL_HIT :: {sym} @ {ltp}")
                             send_trade_message("BUY SL HIT", {
                                 "Symbol": sym,
                                 "Exit LTP": ltp,
@@ -317,6 +337,6 @@ async def run_worker():
                 await asyncio.sleep(SLEEP_INTERVAL)
 
             except Exception as e:
+                log(f"WORKER_EXCEPTION :: {e}")
                 safe_send_message(f"⚠️ Worker error:\n{e}")
-                log(f"Worker exception: {e}")
                 await asyncio.sleep(ERROR_SLEEP)
