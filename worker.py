@@ -51,7 +51,6 @@ stats = {
 
 last_summary_ts = 0
 
-# 🔥 Cold start state
 cold_start_done = False
 cold_start_task_started = False
 
@@ -80,6 +79,9 @@ def send_trade_message(title, data: dict):
     safe_send_message("\n".join(lines))
 
 
+# =====================================================
+# DAILY RESET
+# =====================================================
 def maybe_reset_alerts():
     global trade_state, last_reset_date, stats, last_summary_ts
 
@@ -116,11 +118,11 @@ def maybe_send_summary():
 
     safe_send_message(
         "📊 *Trade Summary (10 min)*\n\n"
-        f"🟢 Entered: {stats['entered']}\n"
-        f"🎯 Target Hit: {stats['target_hit']}\n"
-        f"🛑 SL Hit: {stats['sl_hit']}\n"
-        f"🚪 Exited: {stats['exited']}\n\n"
-        f"⏰ Time: {now_str()}"
+        f"🟢 Entered : {stats['entered']}\n"
+        f"🎯 Target  : {stats['target_hit']}\n"
+        f"🛑 SL      : {stats['sl_hit']}\n"
+        f"🚪 Exited  : {stats['exited']}\n\n"
+        f"⏱ {now_str()}"
     )
 
 # =====================================================
@@ -138,18 +140,14 @@ async def fetch_latest_safe(semaphore, session, symbol):
         return symbol, None
 
 # =====================================================
-# 🔥 ANALYZED API MERGE
+# 🔥 ANALYZED API MERGE (DEDUP SAFE)
 # =====================================================
+def trade_uid(obj):
+    return f"{obj['symbol']}|{obj['entry_time']}|{obj['exit_time']}"
+
+
 def fetch_and_merge_analyzed():
     now = datetime.now(IST)
-
-    merged_summary = {
-        "entered": 0,
-        "target_hit": 0,
-        "stoploss_hit": 0,
-        "not_entered": 0,
-        "market_closed": 0,
-    }
 
     merged_data = {}
 
@@ -165,75 +163,73 @@ def fetch_and_merge_analyzed():
         r.raise_for_status()
         payload = r.json()
 
-        # ---- summary merge ----
-        s = payload.get("summary", {})
-        for k in merged_summary:
-            merged_summary[k] += s.get(k, 0)
-
-        # ---- data merge ----
         for group, buckets in payload.get("the_data", {}).items():
             merged_data.setdefault(group, {})
             for bucket, symbols in buckets.items():
                 merged_data[group].setdefault(bucket, {})
-                merged_data[group][bucket].update(symbols)
+                for obj in symbols.values():
+                    uid = trade_uid(obj)
+                    merged_data[group][bucket][uid] = obj
 
-    return merged_summary, merged_data
+    return merged_data
 
 # =====================================================
-# 🔥 API-BASED COLD START (MERGED)
+# 🔥 COLD START (CLEAN OUTPUT)
 # =====================================================
 def run_cold_start_from_api():
     global cold_start_done
 
     log("Cold start started")
-    safe_send_message("⏪ Cold start summary loading…")
+    safe_send_message("⏪ Loading cold start snapshot…")
 
     try:
-        summary, data = fetch_and_merge_analyzed()
+        data = fetch_and_merge_analyzed()
     except Exception as e:
-        safe_send_message(f"❌ Cold start API failed:\n{e}")
-        log(f"Cold start API error: {e}")
+        safe_send_message(f"❌ Cold start failed:\n{e}")
         cold_start_done = True
         return
 
-    # -------- SUMMARY --------
-    safe_send_message(
-        "📊 *COLD START SUMMARY*\n\n"
-        f"🟢 Entered      : {summary['entered']}\n"
-        f"🎯 Target Hit   : {summary['target_hit']}\n"
-        f"🛑 SL Hit       : {summary['stoploss_hit']}\n"
-        f"🚪 Not Entered  : {summary['not_entered']}\n"
-        f"🏁 Market Closed: {summary['market_closed']}\n\n"
-        f"⏰ Till: {now_str()}"
-    )
-
-    # -------- DETAILED EXITS --------
     exited = data.get("1_exited", {})
 
+    target_hits = exited.get("1_profit", {})
+    sl_hits     = exited.get("2_stoploss", {})
+    mc_hits     = exited.get("3_market_closed", {})
+
+    # -------- SUMMARY --------
+    safe_send_message(
+        "📊 *COLD START SNAPSHOT*\n\n"
+        f"🎯 Target Hit   : {len(target_hits)}\n"
+        f"🛑 SL Hit       : {len(sl_hits)}\n"
+        f"🏁 Market Close : {len(mc_hits)}\n\n"
+        f"⏱ Snapshot @ {now_str()}"
+    )
+
+    # -------- DETAIL BLOCK --------
     def send_exit_block(title, bucket):
         if not bucket:
             return
 
-        blocks = []
-        for sym, obj in bucket.items():
-            blocks.append(
-                f"*{sym}*\n"
+        lines = [f"📉 *{title}* ({len(bucket)})\n"]
+
+        for obj in bucket.values():
+            lines.append(
+                f"🔹 *{obj['symbol']}*\n"
                 f"Entry : {obj['entry']} @ {obj['entry_time']}\n"
                 f"Exit  : {obj['exit_ltp']} @ {obj['exit_time']}\n"
-                f"Qty   : {obj['qty']}\n"
-                f"PnL   : ₹{round(obj.get('pnl', 0), 2)}\n"
+                f"Qty   : {obj['qty']} | "
+                f"PnL : ₹{round(obj.get('pnl', 0), 2)}\n"
             )
 
-        safe_send_message(f"📉 *{title}*\n\n" + "\n".join(blocks))
+        safe_send_message("\n".join(lines))
 
-    send_exit_block("TARGET HIT", exited.get("1_profit", {}))
-    send_exit_block("STOPLOSS HIT", exited.get("2_stoploss", {}))
+    send_exit_block("TARGET HIT", target_hits)
+    send_exit_block("STOPLOSS HIT", sl_hits)
 
     cold_start_done = True
     log("Cold start completed")
 
 # =====================================================
-# WORKER
+# WORKER (UNCHANGED LOGIC)
 # =====================================================
 async def run_worker():
     global cold_start_task_started
@@ -256,7 +252,6 @@ async def run_worker():
 
                 signals = fetch_today_signals()
 
-                # 🔥 Cold start ONCE (non-blocking)
                 if not cold_start_task_started:
                     asyncio.get_running_loop().run_in_executor(
                         None, run_cold_start_from_api
@@ -265,7 +260,6 @@ async def run_worker():
 
                 maybe_send_summary()
 
-                # ---------------- INIT ----------------
                 for s in signals:
                     sym = s["symbol"]
                     if sym not in trade_state:
