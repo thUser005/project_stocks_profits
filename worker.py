@@ -23,7 +23,7 @@ SUMMARY_INTERVAL = 600
 
 # 🔥 Cold start progress config (NEW)
 COLD_PROGRESS_EVERY_SYMBOLS = 100
-COLD_PROGRESS_EVERY_SECONDS = 15
+COLD_PROGRESS_EVERY_SECONDS = 120
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
