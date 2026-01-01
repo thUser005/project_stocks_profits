@@ -1,252 +1,221 @@
+import os
 import asyncio
 import aiohttp
-from datetime import datetime, timedelta, timezone, time as dtime
+import requests
+from datetime import datetime, timedelta, timezone, time as dtime, time
 
 from companies import load_companies
 from signals_api import fetch_today_signals
 from groww_async import (
     fetch_latest_candle,
     fetch_full_day_candles,
+    fetch_intraday_candles,
 )
-from telegram_msg import send_message
 from time_utils import is_market_time
+
+# =====================================================
+# TELEGRAM
+# =====================================================
+BOT = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT = os.environ["TELEGRAM_CHAT_ID"]
+
+def send_message(text):
+    requests.post(
+        f"https://api.telegram.org/bot{BOT}/sendMessage",
+        data={"chat_id": CHAT, "text": text, "parse_mode": "Markdown"},
+        timeout=5,
+    )
 
 # =====================================================
 # CONFIG
 # =====================================================
-CONCURRENCY = 100
-SLEEP_INTERVAL = 1
+CONCURRENCY = 50
+SLEEP_INTERVAL = 5
 ERROR_SLEEP = 15
 MAX_RETRIES = 3
 
-SUMMARY_INTERVAL = 600
-
 IST = timezone(timedelta(hours=5, minutes=30))
+
+BUY_START  = dtime(9, 30)
+BUY_END    = dtime(11, 30)
+
+SELL_START = dtime(10, 0)
+MARKET_END = dtime(15, 30)
+
 RESET_TIME = dtime(9, 15)
 
 # =====================================================
 # STATE
 # =====================================================
 companies = load_companies()
+trade_state = {}   # symbol → trade dict
 last_reset_date = None
 
-trade_state = {}   # symbol → trade info
-
 stats = {
-    "entered": 0,
-    "exited": 0,
+    "buy_entered": 0,
+    "sell_entered": 0,
     "target_hit": 0,
     "sl_hit": 0,
 }
 
-last_summary_ts = 0
-
-
 # =====================================================
 # HELPERS
 # =====================================================
+def now():
+    return datetime.now(IST)
+
 def now_str():
-    return datetime.now(IST).strftime("%H:%M:%S IST")
+    return now().strftime("%H:%M:%S IST")
 
+def in_buy_window():
+    t = now().time()
+    return BUY_START <= t <= BUY_END
 
-def maybe_reset_alerts():
-    global trade_state, last_reset_date, stats, last_summary_ts
+def in_sell_window():
+    t = now().time()
+    return SELL_START <= t <= MARKET_END
 
-    now = datetime.now(IST)
-    today = now.date()
+def maybe_reset():
+    global trade_state, last_reset_date, stats
 
-    if now.time() >= RESET_TIME and last_reset_date != today:
+    today = now().date()
+    if now().time() >= RESET_TIME and last_reset_date != today:
         trade_state.clear()
         last_reset_date = today
-        last_summary_ts = 0
-
-        stats.update({
-            "entered": 0,
-            "exited": 0,
-            "target_hit": 0,
-            "sl_hit": 0,
-        })
-
-        send_message("🔄 Alert & trade state reset for new trading day")
-        print(f"[{now_str()}] 🔄 Daily reset completed")
-
-
-def maybe_send_summary():
-    global last_summary_ts
-
-    now_ts = datetime.now(IST).timestamp()
-    if now_ts - last_summary_ts < SUMMARY_INTERVAL:
-        return
-
-    last_summary_ts = now_ts
-
-    send_message(
-        "📊 *Trade Summary (10 min)*\n\n"
-        f"🟢 Entered: {stats['entered']}\n"
-        f"🎯 Target Hit: {stats['target_hit']}\n"
-        f"🛑 SL Hit: {stats['sl_hit']}\n"
-        f"🚪 Exited: {stats['exited']}\n\n"
-        f"⏰ Time: {datetime.now(IST).strftime('%H:%M IST')}"
-    )
-
+        stats = dict.fromkeys(stats, 0)
+        send_message("🔄 *Daily reset completed*")
 
 # =====================================================
-# COLD START — REPLAY FULL DAY
+# SELL HELPERS (PRIORITY LOGIC)
 # =====================================================
-def replay_full_day(symbol, candles, signal):
-    state = "PENDING"
+def highest_from_candles(candles):
+    return max(c[2] for c in candles)
 
-    for c in candles:
-        high = c[2]
-        low = c[3]
-
-        if state == "PENDING":
-            if high >= signal["entry"]:
-                state = "ENTERED"
-
-        elif state == "ENTERED":
-            if high >= signal["target"]:
-                return "EXITED", "TARGET"
-            if low <= signal["stoploss"]:
-                return "EXITED", "SL"
-
-    return state, None
-
+def compute_sell_levels(high):
+    entry = high * 1.04
+    target = entry * 0.98
+    sl = entry * 1.01
+    return entry, target, sl
 
 # =====================================================
 # SAFE FETCH
 # =====================================================
 async def fetch_latest_safe(semaphore, session, symbol):
     async with semaphore:
-        for attempt in range(MAX_RETRIES):
+        for _ in range(MAX_RETRIES):
             try:
                 _, candle = await fetch_latest_candle(session, symbol)
                 return symbol, candle
             except Exception:
-                if attempt == MAX_RETRIES - 1:
-                    return symbol, None
                 await asyncio.sleep(1)
-
+        return symbol, None
 
 # =====================================================
 # WORKER
 # =====================================================
 async def run_worker():
     timeout = aiohttp.ClientTimeout(total=15)
-    connector = aiohttp.TCPConnector(limit=CONCURRENCY)
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
-    send_message("🟢 Worker started")
-    print(f"[{now_str()}] 🟢 Worker started")
+    send_message("🟢 *Trading Worker Started*")
 
-    async with aiohttp.ClientSession(
-        timeout=timeout,
-        connector=connector,
-    ) as session:
-
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
             try:
-                print(f"\n[{now_str()}] ▶ Cycle started")
-
                 if not is_market_time():
-                    print(f"[{now_str()}] ⛔ Market closed")
                     await asyncio.sleep(60)
                     continue
 
-                maybe_reset_alerts()
-                maybe_send_summary()
+                maybe_reset()
 
                 signals = fetch_today_signals()
-                print(f"[{now_str()}] 📥 Signals: {len(signals)}")
+                symbols = {
+                    s["symbol"]: s
+                    for s in signals
+                    if s.get("symbol") in companies
+                }
 
-                # -------------------------------
-                # COLD START INIT
-                # -------------------------------
-                for s in signals:
-                    sym = s["symbol"]
+                # --------------------------------------------------
+                # SELL PREP (09:15–10:00) — ONCE PER SYMBOL
+                # --------------------------------------------------
+                if now().time() < SELL_START:
+                    for sym in symbols:
+                        if sym in trade_state:
+                            continue
 
-                    if sym in trade_state:
-                        continue
+                        _, candles = await fetch_intraday_candles(
+                            session,
+                            sym,
+                            start_time=time(9, 15),
+                            end_time=time(10, 0),
+                        )
+                        if not candles:
+                            continue
 
-                    _, candles = await fetch_full_day_candles(
-                        session,
-                        sym,
-                        datetime.now(IST).strftime("%Y-%m-%d"),
-                    )
+                        high = highest_from_candles(candles)
+                        entry, target, sl = compute_sell_levels(high)
 
-                    state, reason = replay_full_day(sym, candles, s)
+                        trade_state[sym] = {
+                            "type": "SELL",
+                            "state": "PENDING",
+                            "entry": entry,
+                            "target": target,
+                            "sl": sl,
+                            "completed": False,
+                        }
 
-                    trade_state[sym] = {
-                        "state": state,
-                        "signal": s,
-                        "exit_reason": reason,
-                    }
-
-                    if state == "ENTERED":
-                        stats["entered"] += 1
-
-                    if state == "EXITED":
-                        stats["exited"] += 1
-                        stats["target_hit"] += (reason == "TARGET")
-                        stats["sl_hit"] += (reason == "SL")
-
-                # -------------------------------
-                # LIVE TRACKING
-                # -------------------------------
-                active = [
-                    sym for sym, t in trade_state.items()
-                    if t["state"] != "EXITED"
-                ]
-
+                # --------------------------------------------------
+                # LIVE PRICE TRACKING
+                # --------------------------------------------------
                 tasks = [
                     fetch_latest_safe(semaphore, session, sym)
-                    for sym in active
+                    for sym in symbols
                 ]
 
                 results = await asyncio.gather(*tasks)
 
                 for sym, candle in results:
-                    if not candle:
+                    if not candle or sym not in trade_state:
                         continue
 
                     ltp = candle[4]
                     trade = trade_state[sym]
-                    s = trade["signal"]
 
-                    if trade["state"] == "PENDING":
-                        if ltp >= s["entry"]:
+                    # ==============================
+                    # SELL LOGIC (TOP PRIORITY)
+                    # ==============================
+                    if trade["type"] == "SELL" and in_sell_window():
+
+                        # ENTRY
+                        if trade["state"] == "PENDING" and ltp <= trade["entry"]:
                             trade["state"] = "ENTERED"
-                            stats["entered"] += 1
-
+                            stats["sell_entered"] += 1
                             send_message(
-                                f"🟢 ENTRY\n\n"
-                                f"{companies[sym]['company']}\n"
-                                f"{sym}\n\n"
-                                f"Entry: {s['entry']}\n"
-                                f"LTP: {ltp}"
+                                f"🔴 *SELL ENTRY*\n{sym}\nEntry: {trade['entry']}\nLTP: {ltp}"
                             )
 
-                    elif trade["state"] == "ENTERED":
-                        if ltp >= s["target"]:
-                            trade["state"] = "EXITED"
-                            trade["exit_reason"] = "TARGET"
-                            stats["exited"] += 1
-                            stats["target_hit"] += 1
+                        # EXIT (SL FIRST — PRIORITY)
+                        elif trade["state"] == "ENTERED":
+                            if ltp >= trade["sl"]:
+                                trade["state"] = "EXITED"
+                                trade["completed"] = True
+                                stats["sl_hit"] += 1
+                                send_message(f"🛑 *SELL SL HIT*\n{sym}\nLTP: {ltp}")
 
-                            send_message(f"🎯 TARGET HIT: {sym}")
-
-                        elif ltp <= s["stoploss"]:
-                            trade["state"] = "EXITED"
-                            trade["exit_reason"] = "SL"
-                            stats["exited"] += 1
-                            stats["sl_hit"] += 1
-
-                            send_message(f"🛑 SL HIT: {sym}")
+                            elif ltp <= trade["target"]:
+                                trade["state"] = "EXITED"
+                                trade["completed"] = True
+                                stats["target_hit"] += 1
+                                send_message(f"🎯 *SELL TARGET HIT*\n{sym}\nLTP: {ltp}")
 
                 await asyncio.sleep(SLEEP_INTERVAL)
 
             except Exception as e:
-                print(f"[{now_str()}] ⚠️ Worker error: {e}")
-                send_message(f"⚠️ Worker error:\n{e}")
+                send_message(f"⚠️ *Worker Error*\n{e}")
                 await asyncio.sleep(ERROR_SLEEP)
-                
+
+# =====================================================
+# ENTRY
+# =====================================================
+if __name__ == "__main__":
+    asyncio.run(run_worker())

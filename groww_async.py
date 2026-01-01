@@ -20,7 +20,7 @@ MARKET_OPEN = time(9, 15)
 MARKET_CLOSE = time(15, 30)
 
 # =====================================================
-# INTERNAL HELPER
+# INTERNAL HELPER (LOW LEVEL)
 # =====================================================
 async def _fetch_candles(
     session,
@@ -46,7 +46,7 @@ async def _fetch_candles(
         return []
 
 # =====================================================
-# 1️⃣ FULL MARKET DAY CANDLES
+# 1️⃣ FULL MARKET DAY CANDLES (09:15–15:30)
 # =====================================================
 async def fetch_full_day_candles(
     session,
@@ -105,7 +105,7 @@ async def fetch_latest_candle(
     return symbol, candles[-1] if candles else None
 
 # =====================================================
-# 4️⃣ GENERIC RANGE FETCH (FIX)
+# 4️⃣ GENERIC RANGE FETCH (RAW TIMESTAMP)
 # =====================================================
 async def fetch_candles_for_range(
     session,
@@ -119,5 +119,34 @@ async def fetch_candles_for_range(
         symbol,
         start_ms,
         end_ms,
+        interval,
+    )
+
+# =====================================================
+# 5️⃣ INTRADAY TIME-RANGE FETCH (🔥 REQUIRED FOR SELL LOGIC)
+# =====================================================
+async def fetch_intraday_candles(
+    session,
+    symbol,
+    start_time: time,
+    end_time: time,
+    interval=3,
+):
+    """
+    Fetch candles for today between given IST times
+    Example:
+        09:15 → 10:00
+    """
+
+    today = datetime.now(IST).date()
+
+    start_dt = datetime.combine(today, start_time, tzinfo=IST)
+    end_dt = datetime.combine(today, end_time, tzinfo=IST)
+
+    return symbol, await _fetch_candles(
+        session,
+        symbol,
+        int(start_dt.timestamp() * 1000),
+        int(end_dt.timestamp() * 1000),
         interval,
     )
