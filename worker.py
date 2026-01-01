@@ -1,180 +1,148 @@
-import os
 import asyncio
 import aiohttp
-import requests
-from datetime import datetime, timedelta, timezone, time as dtime, time
+from datetime import datetime, timedelta, timezone, time as dtime
 
 from companies import load_companies
 from signals_api import fetch_today_signals
 from groww_async import (
     fetch_latest_candle,
-    fetch_full_day_candles,
     fetch_intraday_candles,
 )
+from telegram_msg import send_message
 from time_utils import is_market_time
-
-# =====================================================
-# TELEGRAM
-# =====================================================
-BOT = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT = os.environ["TELEGRAM_CHAT_ID"]
-
-def send_message(text):
-    requests.post(
-        f"https://api.telegram.org/bot{BOT}/sendMessage",
-        data={
-            "chat_id": CHAT,
-            "text": text,
-            "parse_mode": "Markdown"
-        },
-        timeout=5
-    )
 
 # =====================================================
 # CONFIG
 # =====================================================
 CONCURRENCY = 100
-MAX_RETRIES = 3
-ERROR_SLEEP = 15
 SLEEP_INTERVAL = 1
+ERROR_SLEEP = 15
+MAX_RETRIES = 3
 SUMMARY_INTERVAL = 600
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-BUY_START  = dtime(9, 30)
-BUY_END    = dtime(11, 30)
+RESET_TIME = dtime(9, 15)
+
+BUY_START = dtime(9, 30)
+BUY_END   = dtime(11, 30)
 
 SELL_START = dtime(10, 0)
-MARKET_END = dtime(15, 30)
-
-RESET_TIME = dtime(9, 15)
+SELL_END   = dtime(15, 30)
 
 # =====================================================
 # STATE
 # =====================================================
 companies = load_companies()
+last_reset_date = None
 
-trade_state = {}
-alerted_buy = set()
-sell_meta = {}
+trade_state = {}   # BUY trades
+sell_state = {}    # SELL trades
 
 stats = {
     "entered": 0,
     "exited": 0,
     "target_hit": 0,
     "sl_hit": 0,
-    "sell_entered": 0,
 }
 
-last_reset_date = None
 last_summary_ts = 0
-initial_summary_sent = False   # ✅ ADDED
+
+# 🔥 COLD START STATE (NEW)
+cold_start_done = False
+cold_start_events = []
+
 
 # =====================================================
 # HELPERS
 # =====================================================
-def now():
-    return datetime.now(IST)
-
 def now_str():
-    return now().strftime("%H:%M:%S IST")
+    return datetime.now(IST).strftime("%H:%M:%S IST")
 
-def in_buy_window():
-    return BUY_START <= now().time() <= BUY_END
 
-def in_sell_window():
-    return SELL_START <= now().time() <= MARKET_END
+def is_buy_time():
+    return BUY_START <= datetime.now(IST).time() <= BUY_END
 
-def maybe_reset():
-    global trade_state, sell_meta, stats, last_reset_date, last_summary_ts, alerted_buy, initial_summary_sent
 
-    today = now().date()
-    if now().time() >= RESET_TIME and last_reset_date != today:
+def is_sell_time():
+    return SELL_START <= datetime.now(IST).time() <= SELL_END
+
+
+def send_trade_message(title, data: dict):
+    lines = [f"📊 *{title}*\n"]
+    for k, v in data.items():
+        lines.append(f"{k:<14}: {v}")
+    send_message("\n".join(lines))
+
+
+def maybe_reset_alerts():
+    global trade_state, sell_state, last_reset_date, stats, last_summary_ts
+
+    now = datetime.now(IST)
+    today = now.date()
+
+    if now.time() >= RESET_TIME and last_reset_date != today:
         trade_state.clear()
-        sell_meta.clear()
-        alerted_buy.clear()
+        sell_state.clear()
+        last_reset_date = today
         last_summary_ts = 0
-        initial_summary_sent = False   # ✅ reset initial snapshot
 
         stats.update({
             "entered": 0,
             "exited": 0,
             "target_hit": 0,
             "sl_hit": 0,
-            "sell_entered": 0,
         })
 
-        last_reset_date = today
-        send_message("🔄 *Daily reset completed*")
+        send_message("🔄 Trade state reset for new trading day")
+
 
 def maybe_send_summary():
     global last_summary_ts
 
-    ts = now().timestamp()
-    if ts - last_summary_ts < SUMMARY_INTERVAL:
+    now_ts = datetime.now(IST).timestamp()
+    if now_ts - last_summary_ts < SUMMARY_INTERVAL:
         return
 
-    last_summary_ts = ts
+    last_summary_ts = now_ts
 
     send_message(
         "📊 *Trade Summary (10 min)*\n\n"
         f"🟢 Entered: {stats['entered']}\n"
         f"🎯 Target Hit: {stats['target_hit']}\n"
         f"🛑 SL Hit: {stats['sl_hit']}\n"
-        f"🚪 Exited: {stats['exited']}\n"
-        f"🔴 SELL Trades: {stats['sell_entered']}\n\n"
-        f"⏰ {now().strftime('%H:%M IST')}"
+        f"🚪 Exited: {stats['exited']}\n\n"
+        f"⏰ Time: {now_str()}"
     )
 
+
 # =====================================================
-# INITIAL SUMMARY (✅ ADDED, NO LOGIC CHANGE)
+# SELL SETUP (UNCHANGED)
 # =====================================================
-def send_initial_summary():
-    send_message(
-        "📊 *Initial Trade Summary (Server Restart)*\n\n"
-        f"🟢 BUY Entered: {stats['entered']}\n"
-        f"🚪 BUY Exited: {stats['exited']}\n"
-        f"🎯 Target Hit: {stats['target_hit']}\n"
-        f"🛑 SL Hit: {stats['sl_hit']}\n"
-        f"🔴 SELL Trades (live only): {stats['sell_entered']}\n\n"
-        f"⏰ Snapshot at: {now().strftime('%H:%M IST')}"
+async def calculate_sell_setup(session, symbol):
+    _, candles = await fetch_intraday_candles(
+        session,
+        symbol,
+        start_time=dtime(9, 15),
+        end_time=dtime(10, 0),
     )
 
-# =====================================================
-# BUY REPLAY LOGIC (UNCHANGED)
-# =====================================================
-def replay_full_day(symbol, candles, signal):
-    state = "PENDING"
+    if not candles:
+        return None
 
-    for c in candles:
-        high = c[2]
-        low = c[3]
+    highest = max(c[2] for c in candles)
+    entry = round(highest * 1.04, 2)
 
-        if state == "PENDING" and high >= signal["entry"]:
-            state = "ENTERED"
+    return {
+        "entry": entry,
+        "target": round(entry * 0.98, 2),
+        "stoploss": round(entry * 1.01, 2),
+        "state": "WAITING",
+    }
 
-        elif state == "ENTERED":
-            if high >= signal["target"]:
-                return "EXITED", "TARGET"
-            if low <= signal["stoploss"]:
-                return "EXITED", "SL"
-
-    return state, None
 
 # =====================================================
-# SELL HELPERS (UNCHANGED)
-# =====================================================
-def highest_from_candles(candles):
-    return max(c[2] for c in candles)
-
-def compute_sell_levels(high):
-    entry = high * 1.04
-    target = entry * 0.98
-    sl = entry * 1.01
-    return entry, target, sl
-
-# =====================================================
-# SAFE FETCH
+# SAFE FETCH (UNCHANGED)
 # =====================================================
 async def fetch_latest_safe(semaphore, session, symbol):
     async with semaphore:
@@ -186,59 +154,141 @@ async def fetch_latest_safe(semaphore, session, symbol):
                 await asyncio.sleep(1)
         return symbol, None
 
+
+# =====================================================
+# 🔥 COLD START REPLAY (NEW)
+# =====================================================
+async def replay_symbol(session, sym, signal):
+    events = []
+
+    _, candles = await fetch_intraday_candles(
+        session,
+        sym,
+        start_time=dtime(9, 15),
+        end_time=datetime.now(IST).time(),
+    )
+
+    if not candles:
+        return events
+
+    # ---- BUY REPLAY ----
+    buy_state = "PENDING"
+
+    for c in candles:
+        ts = datetime.fromtimestamp(c[0] / 1000, IST)
+        high, low = c[2], c[3]
+
+        if buy_state == "PENDING" and BUY_START <= ts.time() <= BUY_END:
+            if high >= signal["entry"]:
+                buy_state = "ENTERED"
+                events.append((ts, sym, "BUY ENTRY", signal["entry"]))
+
+        elif buy_state == "ENTERED":
+            if high >= signal["target"]:
+                events.append((ts, sym, "BUY TARGET HIT", signal["target"]))
+                break
+            if low <= signal["stoploss"]:
+                events.append((ts, sym, "BUY SL HIT", signal["stoploss"]))
+                break
+
+    # ---- SELL REPLAY ----
+    setup = await calculate_sell_setup(session, sym)
+    if not setup:
+        return events
+
+    sell_state = "WAITING"
+
+    for c in candles:
+        ts = datetime.fromtimestamp(c[0] / 1000, IST)
+        high, low = c[2], c[3]
+
+        if ts.time() < SELL_START:
+            continue
+
+        if sell_state == "WAITING" and low <= setup["entry"]:
+            sell_state = "ENTERED"
+            events.append((ts, sym, "SELL ENTRY", setup["entry"]))
+
+        elif sell_state == "ENTERED":
+            if low <= setup["target"]:
+                events.append((ts, sym, "SELL TARGET HIT", setup["target"]))
+                break
+            if high >= setup["stoploss"]:
+                events.append((ts, sym, "SELL SL HIT", setup["stoploss"]))
+                break
+
+    return events
+
+
+def send_cold_start_summary(events):
+    if not events:
+        send_message("ℹ️ No trades hit before server start")
+        return
+
+    lines = ["📊 *COLD START SUMMARY*\n"]
+
+    for ts, sym, event, price in events:
+        lines.append(
+            f"{ts.strftime('%H:%M')} | {sym}\n"
+            f"Event : {event}\n"
+            f"Price : {price}\n"
+        )
+
+    send_message("\n".join(lines))
+
+
 # =====================================================
 # WORKER
 # =====================================================
 async def run_worker():
-    global initial_summary_sent
+    global cold_start_done
 
     timeout = aiohttp.ClientTimeout(total=15)
+    connector = aiohttp.TCPConnector(limit=CONCURRENCY)
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
-    send_message("🟢 *Trading Worker Started*")
+    send_message("🟢 Worker started")
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         while True:
             try:
                 if not is_market_time():
                     await asyncio.sleep(60)
                     continue
 
-                maybe_reset()
+                maybe_reset_alerts()
                 maybe_send_summary()
 
                 signals = fetch_today_signals()
-                signal_map = {s["symbol"]: s for s in signals if s["symbol"] in companies}
 
-                # ---------------- BUY COLD START REPLAY ----------------
-                for sym, s in signal_map.items():
-                    if sym in trade_state:
-                        continue
+                # 🔥 COLD START (RUN ONCE)
+                if not cold_start_done:
+                    send_message("⏪ Replaying trades since market open...")
+                    for s in signals:
+                        cold_start_events.extend(
+                            await replay_symbol(session, s["symbol"], s)
+                        )
+                    send_cold_start_summary(cold_start_events)
+                    cold_start_done = True
 
-                    _, candles = await fetch_full_day_candles(
-                        session, sym, now().strftime("%Y-%m-%d")
-                    )
+                # ---------------- INIT ----------------
+                for s in signals:
+                    sym = s["symbol"]
 
-                    state, reason = replay_full_day(sym, candles, s)
-                    trade_state[sym] = {"state": state, "signal": s}
+                    if sym not in trade_state:
+                        trade_state[sym] = {"state": "PENDING", "signal": s}
 
-                    if state == "ENTERED":
-                        stats["entered"] += 1
-                    if state == "EXITED":
-                        stats["exited"] += 1
-                        stats["target_hit"] += (reason == "TARGET")
-                        stats["sl_hit"] += (reason == "SL")
+                    if sym not in sell_state:
+                        setup = await calculate_sell_setup(session, sym)
+                        if setup:
+                            sell_state[sym] = setup
 
-                # ✅ SEND INITIAL SUMMARY ONCE
-                if not initial_summary_sent:
-                    send_initial_summary()
-                    initial_summary_sent = True
-                    last_summary_ts = now().timestamp()
+                active = set(trade_state) | set(sell_state)
 
-                # ---------------- LIVE FETCH ----------------
-                active_symbols = set(signal_map) | set(sell_meta)
-                tasks = [fetch_latest_safe(semaphore, session, s) for s in active_symbols]
-                results = await asyncio.gather(*tasks)
+                results = await asyncio.gather(*[
+                    fetch_latest_safe(semaphore, session, sym)
+                    for sym in active
+                ])
 
                 for sym, candle in results:
                     if not candle:
@@ -246,17 +296,70 @@ async def run_worker():
 
                     ltp = candle[4]
 
-                    # BUY + SELL LOGIC (UNCHANGED BELOW)
-                    # 🔒 NO CHANGES MADE HERE
+                    # ===== BUY =====
+                    buy = trade_state.get(sym)
+                    if buy:
+                        s = buy["signal"]
+
+                        if buy["state"] == "PENDING" and is_buy_time() and ltp >= s["entry"]:
+                            buy["state"] = "ENTERED"
+                            stats["entered"] += 1
+
+                            send_trade_message("BUY ENTRY", {
+                                "Symbol": sym,
+                                "Entry": s["entry"],
+                                "LTP": ltp,
+                                "Time": now_str(),
+                            })
+
+                        elif buy["state"] == "ENTERED":
+                            if ltp >= s["target"]:
+                                buy["state"] = "EXITED"
+                                stats["exited"] += 1
+                                stats["target_hit"] += 1
+                                send_trade_message("BUY TARGET HIT", {
+                                    "Symbol": sym,
+                                    "Exit LTP": ltp,
+                                })
+
+                            elif ltp <= s["stoploss"]:
+                                buy["state"] = "EXITED"
+                                stats["exited"] += 1
+                                stats["sl_hit"] += 1
+                                send_trade_message("BUY SL HIT", {
+                                    "Symbol": sym,
+                                    "Exit LTP": ltp,
+                                })
+
+                    # ===== SELL =====
+                    sell = sell_state.get(sym)
+                    if sell and is_sell_time():
+
+                        if sell["state"] == "WAITING" and ltp <= sell["entry"]:
+                            sell["state"] = "ENTERED"
+                            send_trade_message("SELL ENTRY", {
+                                "Symbol": sym,
+                                "Entry": sell["entry"],
+                                "LTP": ltp,
+                            })
+
+                        elif sell["state"] == "ENTERED":
+                            if ltp <= sell["target"]:
+                                sell["state"] = "EXITED"
+                                send_trade_message("SELL TARGET HIT", {
+                                    "Symbol": sym,
+                                    "Exit LTP": ltp,
+                                })
+
+                            elif ltp >= sell["stoploss"]:
+                                sell["state"] = "EXITED"
+                                send_trade_message("SELL SL HIT", {
+                                    "Symbol": sym,
+                                    "Exit LTP": ltp,
+                                })
 
                 await asyncio.sleep(SLEEP_INTERVAL)
 
             except Exception as e:
-                send_message(f"⚠️ *Worker Error*\n{e}")
+                send_message(f"⚠️ Worker error:\n{e}")
                 await asyncio.sleep(ERROR_SLEEP)
-
-# =====================================================
-# ENTRY
-# =====================================================
-if __name__ == "__main__":
-    asyncio.run(run_worker())
