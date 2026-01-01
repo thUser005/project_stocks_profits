@@ -16,7 +16,7 @@ SLEEP_INTERVAL = 20
 ERROR_SLEEP = 15
 MAX_RETRIES = 3
 
-SUMMARY_INTERVAL = 600  # ⏱ 10 minutes (in seconds)
+SUMMARY_INTERVAL = 600  # 10 minutes
 
 IST = timezone(timedelta(hours=5, minutes=30))
 RESET_TIME = dtime(9, 15)
@@ -28,7 +28,6 @@ companies = load_companies()
 alerted = set()
 last_reset_date = None
 
-# 📊 STATS
 stats = {
     "entered": 0,
     "exited": 0,
@@ -42,10 +41,11 @@ last_summary_ts = 0
 # =====================================================
 # HELPERS
 # =====================================================
+def now_str():
+    return datetime.now(IST).strftime("%H:%M:%S IST")
+
+
 def maybe_reset_alerts():
-    """
-    Reset alerted symbols + stats once per trading day
-    """
     global alerted, last_reset_date, stats, last_summary_ts
 
     now = datetime.now(IST)
@@ -64,17 +64,14 @@ def maybe_reset_alerts():
                 "sl_hit": 0,
             }
 
+            print(f"[{now_str()}] 🔄 Daily reset completed")
             send_message("🔄 Alert & stats reset for new trading day")
 
 
 def maybe_send_summary():
-    """
-    Send Telegram summary every 10 minutes
-    """
     global last_summary_ts
 
     now_ts = datetime.now(IST).timestamp()
-
     if now_ts - last_summary_ts < SUMMARY_INTERVAL:
         return
 
@@ -111,6 +108,7 @@ async def run_worker():
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
     send_message("🟢 Worker started")
+    print(f"[{now_str()}] 🟢 Worker started")
 
     async with aiohttp.ClientSession(
         timeout=timeout,
@@ -119,20 +117,19 @@ async def run_worker():
 
         while True:
             try:
-                # -------------------------------
-                # Market guard
-                # -------------------------------
+                print(f"\n[{now_str()}] ▶ Cycle started")
+
                 if not is_market_time():
+                    print(f"[{now_str()}] ⛔ Market closed, sleeping")
                     await asyncio.sleep(60)
                     continue
 
                 maybe_reset_alerts()
                 maybe_send_summary()
 
-                # -------------------------------
-                # Fetch signals
-                # -------------------------------
                 signals = fetch_today_signals()
+                print(f"[{now_str()}] 📥 Signals received: {len(signals)}")
+
                 if not signals:
                     await asyncio.sleep(SLEEP_INTERVAL)
                     continue
@@ -148,6 +145,8 @@ async def run_worker():
                     symbols.append(sym)
                     signal_map[sym] = s
 
+                print(f"[{now_str()}] 🔍 Symbols eligible for fetch: {len(symbols)}")
+
                 if not symbols:
                     await asyncio.sleep(SLEEP_INTERVAL)
                     continue
@@ -158,6 +157,11 @@ async def run_worker():
                 ]
 
                 results = await asyncio.gather(*tasks)
+
+                fetched = sum(1 for _, c in results if c)
+                entered_this_cycle = 0
+
+                print(f"[{now_str()}] 📡 Groww candles fetched: {fetched}")
 
                 for sym, candle in results:
                     if not candle or len(candle) < 5 or sym in alerted:
@@ -171,7 +175,6 @@ async def run_worker():
                     if ltp is None:
                         continue
 
-                    # 🔔 ENTRY
                     if ltp >= s["open"]:
                         meta = companies[sym]
 
@@ -188,9 +191,15 @@ async def run_worker():
 
                         alerted.add(sym)
                         stats["entered"] += 1
+                        entered_this_cycle += 1
+
+                print(f"[{now_str()}] 🟢 Entries this cycle: {entered_this_cycle}")
+                print(f"[{now_str()}] 📊 Total entered today: {stats['entered']}")
+                print(f"[{now_str()}] ⏳ Cycle completed, sleeping {SLEEP_INTERVAL}s")
 
                 await asyncio.sleep(SLEEP_INTERVAL)
 
             except Exception as e:
+                print(f"[{now_str()}] ⚠️ Worker error: {e}")
                 send_message(f"⚠️ Worker loop error:\n{e}")
                 await asyncio.sleep(ERROR_SLEEP)
