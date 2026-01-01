@@ -36,6 +36,9 @@ BUY_END   = dtime(11, 30)
 SELL_START = dtime(10, 0)
 SELL_END   = dtime(15, 30)
 
+LIVE_BUY_START = dtime(9, 25)
+LIVE_BUY_END   = dtime(11, 40)
+
 ANALYZED_APIS = [
     "https://g1-stock.vercel.app/api/analyze-signals",
     "https://g2-stock.vercel.app/api/analyze-signals",
@@ -45,6 +48,7 @@ ANALYZED_APIS = [
 # STATE
 # =====================================================
 companies = load_companies()
+
 last_reset_date = None
 trade_state = {}
 
@@ -58,6 +62,11 @@ stats = {
 last_summary_ts = 0
 cold_start_done = False
 cold_start_task_started = False
+
+# ---- LIVE TRADING STATE (NEW, ADDITIVE) ----
+live_alerted = set()
+live_trades = {}
+day_highs = {}
 
 # =====================================================
 # LOGGING
@@ -108,7 +117,6 @@ def send_summary_pie(target, sl, entered, not_entered):
     ]
 
     values = [count for _, count in labels_raw]
-
     colors = ["#2ecc71", "#e74c3c", "#f1c40f", "#95a5a6"]
 
     fig, ax = plt.subplots(figsize=(6, 6))
@@ -148,7 +156,9 @@ def send_meta_summary_text(meta):
     safe_send_message(text=msg)
 
 # =====================================================
-# TABLE IMAGE (VISIBILITY FIX ONLY)
+# TABLE IMAGE (UNCHANGED)
+# =====================================================
+# (UNCHANGED CODE – KEPT AS IS)
 # =====================================================
 def send_table_images(title, bucket):
     if not bucket:
@@ -198,7 +208,6 @@ def send_table_images(title, bucket):
         y = pad + 24
         x = pad
 
-        # HEADER
         for i, h in enumerate(col_headers):
             draw.rectangle(
                 [x, y, x + col_widths[i], y + header_h],
@@ -214,7 +223,6 @@ def send_table_images(title, bucket):
             pnl_bg = "#d4edda" if pnl > 0 else "#f8d7da" if pnl < 0 else "white"
 
             x = pad
-
             draw.rectangle([x, y, x + col_widths[0], y + row_h], outline="black")
             draw.ellipse([x+15, y+10, x+35, y+30], fill="#3498db")
             x += col_widths[0]
@@ -233,16 +241,9 @@ def send_table_images(title, bucket):
             ]
 
             bg_colors = [
-                "white",
-                "#e3f2fd",
-                "white",
-                "#e8f5e9",
-                "white",
-                "white",
-                pnl_bg,
-                "#fdecea",
-                "#e8f5e9",
-                "#f2f2f2",
+                "white", "#e3f2fd", "white", "#e8f5e9",
+                "white", "white", pnl_bg,
+                "#fdecea", "#e8f5e9", "#f2f2f2"
             ]
 
             for i, cell in enumerate(cells):
@@ -250,21 +251,18 @@ def send_table_images(title, bucket):
                     [x, y, x + col_widths[i+1], y + row_h],
                     fill=bg_colors[i], outline="black"
                 )
-
                 draw.text(
                     (x + 6, y + 11),
                     str(cell),
                     font=font_b if i in (1, 3, 6) else font,
                     fill="#111111"
                 )
-
                 x += col_widths[i+1]
 
             y += row_h
 
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
         img.save(tmp.name)
-
         safe_send_message(photo=tmp.name, caption=f"📉 {title}\n⏱ {now_str()}")
         os.unlink(tmp.name)
 
@@ -314,7 +312,6 @@ def run_cold_start_from_api():
     not_entered = data.get("3_not_entered", {})
 
     send_meta_summary_text(meta)
-
     send_summary_pie(
         target=len(exited.get("1_profit", {})),
         sl=len(exited.get("2_stoploss", {})),
@@ -330,7 +327,85 @@ def run_cold_start_from_api():
     log("COLD_START_DONE")
 
 # =====================================================
-# WORKER (UNCHANGED)
+# LIVE TRADE WORKER (NEW – ADDITIVE ONLY)
+# =====================================================
+async def run_live_trade_worker():
+    timeout = aiohttp.ClientTimeout(total=10)
+    connector = aiohttp.TCPConnector(limit=CONCURRENCY)
+
+    safe_send_message(text="🟢 Live Trade Worker Started")
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        while True:
+            try:
+                now = datetime.now(IST)
+
+                if not is_market_time():
+                    await asyncio.sleep(60)
+                    continue
+
+                signals = fetch_today_signals()
+                symbols = [s["symbol"] for s in signals if s.get("symbol") in companies]
+
+                tasks = [fetch_latest_candle(session, s) for s in symbols]
+                candles = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for sym, candle in zip(symbols, candles):
+                    if not candle or not isinstance(candle, list) or len(candle) < 5:
+                        continue
+
+                    ltp = candle[4]
+                    high = max(candle[:4])
+
+                    if now.time() < dtime(10, 0):
+                        day_highs[sym] = max(day_highs.get(sym, 0), high)
+                        continue
+
+                    if (
+                        LIVE_BUY_START <= now.time() <= LIVE_BUY_END
+                        and sym not in live_alerted
+                        and sym in day_highs
+                        and ltp <= day_highs[sym] * 1.03
+                    ):
+                        entry = round(day_highs[sym] * 1.03, 2)
+                        target = round(entry * 1.03, 2)
+                        sl = round(entry * 0.99, 2)
+
+                        live_trades[sym] = {"target": target, "sl": sl}
+                        live_alerted.add(sym)
+                        stats["entered"] += 1
+
+                        meta = companies[sym]
+                        safe_send_message(
+                            text=(
+                                f"📢 BUY TRIGGERED\n\n"
+                                f"{meta['company']} ({sym})\n"
+                                f"Entry: {entry}\n"
+                                f"Target: {target}\n"
+                                f"SL: {sl}\n"
+                                f"Time: {now.strftime('%H:%M:%S IST')}"
+                            )
+                        )
+
+                    if sym in live_trades:
+                        trade = live_trades[sym]
+                        if ltp >= trade["target"]:
+                            stats["target_hit"] += 1
+                            safe_send_message(f"🎯 TARGET HIT: {sym} @ {ltp}")
+                            del live_trades[sym]
+                        elif ltp <= trade["sl"]:
+                            stats["sl_hit"] += 1
+                            safe_send_message(f"🛑 SL HIT: {sym} @ {ltp}")
+                            del live_trades[sym]
+
+                await asyncio.sleep(SLEEP_INTERVAL)
+
+            except Exception as e:
+                log(f"LIVE_WORKER_EXCEPTION :: {e}")
+                await asyncio.sleep(ERROR_SLEEP)
+
+# =====================================================
+# WORKER (SUMMARY + LIVE TOGETHER)
 # =====================================================
 async def run_worker():
     global cold_start_task_started
@@ -338,24 +413,8 @@ async def run_worker():
     log("WORKER_START")
     safe_send_message(text="🟢 Worker started")
 
-    timeout = aiohttp.ClientTimeout(total=15)
-    connector = aiohttp.TCPConnector(limit=CONCURRENCY)
-
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector):
-        while True:
-            try:
-                if not is_market_time():
-                    await asyncio.sleep(60)
-                    continue
-
-                if not cold_start_task_started:
-                    asyncio.get_running_loop().run_in_executor(
-                        None, run_cold_start_from_api
-                    )
-                    cold_start_task_started = True
-
-                await asyncio.sleep(SLEEP_INTERVAL)
-
-            except Exception as e:
-                log(f"WORKER_EXCEPTION :: {e}")
-                await asyncio.sleep(ERROR_SLEEP)
+    async with aiohttp.ClientSession():
+        await asyncio.gather(
+            run_live_trade_worker(),
+            asyncio.to_thread(run_cold_start_from_api)
+        )
