@@ -11,14 +11,13 @@ from time_utils import is_market_time
 # =====================================================
 # CONFIG
 # =====================================================
-CONCURRENCY = 50          # SAFE for Groww (do NOT exceed 15)
-BATCH_SIZE = 100           # how many symbols per gather
-SLEEP_INTERVAL = 20       # seconds between cycles
+CONCURRENCY = 15        # ⛔ DO NOT exceed Groww limits
+SLEEP_INTERVAL = 20
 ERROR_SLEEP = 15
 MAX_RETRIES = 3
 
 IST = timezone(timedelta(hours=5, minutes=30))
-RESET_TIME = (9, 15)      # reset alerts daily at 09:15 IST
+RESET_TIME = (9, 15)
 
 # =====================================================
 # STATE
@@ -47,17 +46,19 @@ def maybe_reset_alerts():
             send_message("🔄 Alert state reset for new trading day")
 
 
-def chunked(iterable, size):
+async def fetch_latest_safe(semaphore, session, symbol):
     """
-    Yield list chunks of given size
+    Fetch latest candle with retry + concurrency guard
     """
-    for i in range(0, len(iterable), size):
-        yield iterable[i:i + size]
-
-
-async def fetch_with_semaphore(semaphore, session, symbol):
     async with semaphore:
-        return await fetch_latest_candle(session, symbol)
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                candle = await fetch_latest_candle(session, symbol)
+                return symbol, candle
+            except Exception:
+                if attempt == MAX_RETRIES:
+                    return symbol, None
+                await asyncio.sleep(1)
 
 
 # =====================================================
@@ -85,7 +86,7 @@ async def run_worker():
                 maybe_reset_alerts()
 
                 # -------------------------------
-                # Fetch signals (API = source of truth)
+                # Fetch signals (source of truth)
                 # -------------------------------
                 signals = fetch_today_signals()
                 if not signals:
@@ -93,84 +94,72 @@ async def run_worker():
                     continue
 
                 # -------------------------------
-                # Filter symbols to process
+                # Filter symbols
                 # -------------------------------
                 symbols = []
                 signal_map = {}
 
                 for s in signals:
-                    symbol = s["symbol"]
-                    if symbol not in companies:
+                    sym = s["symbol"]
+                    if sym not in companies:
                         continue
-                    if symbol in alerted:
+                    if sym in alerted:
                         continue
 
-                    symbols.append(symbol)
-                    signal_map[symbol] = s
+                    symbols.append(sym)
+                    signal_map[sym] = s
 
                 if not symbols:
                     await asyncio.sleep(SLEEP_INTERVAL)
                     continue
 
                 # -------------------------------
-                # Process in batches
+                # 🔥 FIRE ALL REQUESTS AT ONCE
                 # -------------------------------
-                for batch in chunked(symbols, BATCH_SIZE):
-                    retries = 0
+                tasks = [
+                    fetch_latest_safe(semaphore, session, sym)
+                    for sym in symbols
+                ]
 
-                    while retries < MAX_RETRIES:
-                        try:
-                            tasks = [
-                                fetch_with_semaphore(semaphore, session, sym)
-                                for sym in batch
-                            ]
+                results = await asyncio.gather(*tasks)
 
-                            results = await asyncio.gather(*tasks, return_exceptions=True)
+                # -------------------------------
+                # Process results
+                # -------------------------------
+                for sym, candle in results:
+                    if not candle:
+                        continue
+                    if sym in alerted:
+                        continue
 
-                            for sym, candle in results:
-                                if not candle:
-                                    continue
-                                if sym in alerted:
-                                    continue
+                    s = signal_map.get(sym)
+                    if not s:
+                        continue
 
-                                s = signal_map.get(sym)
-                                if not s:
-                                    continue
+                    open_price = s["open"]
+                    entry = s["entry"]
+                    target = s["target"]
+                    sl = s["stoploss"]
 
-                                open_price = s["open"]
-                                entry = s["entry"]
-                                target = s["target"]
-                                sl = s["stoploss"]
+                    ltp = candle[4]
 
-                                ltp = candle[4]
+                    # 🔔 TRIGGER CONDITION
+                    if ltp >= open_price:
+                        meta = companies[sym]
 
-                                # 🔔 CONDITION
-                                if ltp >= open_price:
-                                    meta = companies[sym]
+                        msg = (
+                            f"📢 STOCK TRIGGERED\n\n"
+                            f"Company: {meta['company']}\n"
+                            f"Symbol: {sym}\n\n"
+                            f"Open: {open_price}\n"
+                            f"LTP: {ltp}\n"
+                            f"Entry: {entry}\n"
+                            f"Target: {target}\n"
+                            f"SL: {sl}"
+                        )
 
-                                    msg = (
-                                        f"📢 STOCK TRIGGERED\n\n"
-                                        f"Company: {meta['company']}\n"
-                                        f"Symbol: {sym}\n\n"
-                                        f"Open: {open_price}\n"
-                                        f"LTP: {ltp}\n"
-                                        f"Entry: {entry}\n"
-                                        f"Target: {target}\n"
-                                        f"SL: {sl}"
-                                    )
-
-                                    send_message(msg)
-                                    alerted.add(sym)
-
-                            break  # batch success → exit retry loop
-
-                        except Exception as e:
-                            retries += 1
-                            if retries >= MAX_RETRIES:
-                                send_message(
-                                    f"⚠️ Batch failed after {MAX_RETRIES} retries\n{e}"
-                                )
-                            await asyncio.sleep(3)
+                        send_message(msg)
+                        alerted.add(sym)
 
                 await asyncio.sleep(SLEEP_INTERVAL)
 
