@@ -75,7 +75,7 @@ def acquire_pid_lock_with_prompt():
         old_port = int(f.read().strip())
 
     print(f"\n⚠️ App already running (PID {old_pid}, port {old_port})")
-    ans = input("❓ Do you want to STOP old app and start new one? (yes/no): ").strip().lower()
+    ans = 'yes'
 
     if ans != "yes":
         print("🚫 Keeping existing app. Exiting.")
@@ -86,6 +86,8 @@ def acquire_pid_lock_with_prompt():
         print("🛑 Sending soft-stop request to old app...")
         requests.post(f"http://127.0.0.1:{old_port}/admin/stop", timeout=5)
         time.sleep(2)
+        print("🛑 Sending soft-stop request to old app...")
+        
     except Exception as e:
         print("⚠️ Failed to contact old app:", e)
 
