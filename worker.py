@@ -21,7 +21,7 @@ ERROR_SLEEP = 15
 MAX_RETRIES = 3
 SUMMARY_INTERVAL = 600
 
-# 🔥 Cold start progress config (NEW)
+# 🔥 Cold start progress config (ADDED)
 COLD_PROGRESS_EVERY_SYMBOLS = 100
 COLD_PROGRESS_EVERY_SECONDS = 120
 
@@ -53,17 +53,35 @@ stats = {
 
 last_summary_ts = 0
 
-# 🔥 COLD START STATE
+# 🔥 Cold start state (ADDED)
 cold_start_done = False
 cold_start_events = []
 cold_start_last_progress_ts = 0
+cold_start_task_started = False
 
+# 🔥 Fetch statistics (ADDED)
+fetch_stats = {
+    "success": 0,
+    "empty": 0,
+    "failed": 0,
+}
 
 # =====================================================
 # HELPERS
 # =====================================================
 def now_str():
     return datetime.now(IST).strftime("%H:%M:%S IST")
+
+
+def log(msg):
+    print(f"[{now_str()}] {msg}")
+
+
+def safe_send_message(text):
+    try:
+        send_message(text)
+    except Exception as e:
+        log(f"❌ Telegram send failed: {e}")
 
 
 def is_buy_time():
@@ -78,7 +96,7 @@ def send_trade_message(title, data: dict):
     lines = [f"📊 *{title}*\n"]
     for k, v in data.items():
         lines.append(f"{k:<14}: {v}")
-    send_message("\n".join(lines))
+    safe_send_message("\n".join(lines))
 
 
 def maybe_reset_alerts():
@@ -100,7 +118,8 @@ def maybe_reset_alerts():
             "sl_hit": 0,
         })
 
-        send_message("🔄 Trade state reset for new trading day")
+        safe_send_message("🔄 Trade state reset for new trading day")
+        log("Daily reset completed")
 
 
 def maybe_send_summary():
@@ -115,7 +134,7 @@ def maybe_send_summary():
 
     last_summary_ts = now_ts
 
-    send_message(
+    safe_send_message(
         "📊 *Trade Summary (10 min)*\n\n"
         f"🟢 Entered: {stats['entered']}\n"
         f"🎯 Target Hit: {stats['target_hit']}\n"
@@ -123,7 +142,6 @@ def maybe_send_summary():
         f"🚪 Exited: {stats['exited']}\n\n"
         f"⏰ Time: {now_str()}"
     )
-
 
 # =====================================================
 # SELL SETUP (UNCHANGED)
@@ -149,23 +167,27 @@ async def calculate_sell_setup(session, symbol):
         "state": "WAITING",
     }
 
-
 # =====================================================
-# SAFE FETCH
+# SAFE FETCH (COUNTING ADDED)
 # =====================================================
 async def fetch_latest_safe(semaphore, session, symbol):
     async with semaphore:
         for _ in range(MAX_RETRIES):
             try:
                 _, candle = await fetch_latest_candle(session, symbol)
-                return symbol, candle
-            except Exception:
+                if candle:
+                    fetch_stats["success"] += 1
+                    return symbol, candle
+                else:
+                    fetch_stats["empty"] += 1
+            except Exception as e:
+                fetch_stats["failed"] += 1
+                log(f"⚠️ Candle fetch failed for {symbol}: {e}")
                 await asyncio.sleep(1)
         return symbol, None
 
-
 # =====================================================
-# 🔥 COLD START REPLAY
+# 🔥 COLD START REPLAY (UNCHANGED LOGIC)
 # =====================================================
 async def replay_symbol(session, sym, signal):
     events = []
@@ -229,7 +251,7 @@ async def replay_symbol(session, sym, signal):
 
 def send_cold_start_summary(events):
     if not events:
-        send_message("ℹ️ No trades hit before server start")
+        safe_send_message("ℹ️ No trades hit before server start")
         return
 
     lines = ["📊 *COLD START SUMMARY*\n"]
@@ -241,20 +263,70 @@ def send_cold_start_summary(events):
             f"Price : {price}\n"
         )
 
-    send_message("\n".join(lines))
+    safe_send_message("\n".join(lines))
 
+# =====================================================
+# 🔥 BACKGROUND COLD START TASK (ADDED)
+# =====================================================
+async def cold_start_task(session, signals):
+    global cold_start_done, cold_start_last_progress_ts
+
+    log("Cold start replay started")
+    safe_send_message("⏪ Cold start replay started…")
+
+    total = len(signals)
+    processed = 0
+    detected = 0
+    cold_start_last_progress_ts = time.time()
+
+    for s in signals:
+        try:
+            events = await replay_symbol(session, s["symbol"], s)
+            cold_start_events.extend(events)
+
+            processed += 1
+            detected += len(events)
+
+            now_ts = time.time()
+            if (
+                processed % COLD_PROGRESS_EVERY_SYMBOLS == 0
+                or now_ts - cold_start_last_progress_ts >= COLD_PROGRESS_EVERY_SECONDS
+            ):
+                safe_send_message(
+                    "⏳ *Cold start in progress…*\n\n"
+                    f"Processed : {processed} / {total}\n"
+                    f"Events    : {detected}\n"
+                    f"Time      : {now_str()}"
+                )
+                log(f"Cold start progress {processed}/{total}, events={detected}")
+                cold_start_last_progress_ts = now_ts
+
+        except Exception as e:
+            log(f"❌ Cold start error for {s['symbol']}: {e}")
+
+    safe_send_message(
+        "✅ *Cold start replay completed*\n\n"
+        f"Total symbols : {total}\n"
+        f"Total events  : {detected}\n"
+        f"Completed at  : {now_str()}"
+    )
+
+    send_cold_start_summary(cold_start_events)
+    cold_start_done = True
+    log("Cold start replay completed")
 
 # =====================================================
 # WORKER
 # =====================================================
 async def run_worker():
-    global cold_start_done, cold_start_last_progress_ts
+    global cold_start_task_started
 
     timeout = aiohttp.ClientTimeout(total=15)
     connector = aiohttp.TCPConnector(limit=CONCURRENCY)
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
-    send_message("🟢 Worker started")
+    safe_send_message("🟢 Worker started")
+    log("Worker loop started")
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         while True:
@@ -267,44 +339,10 @@ async def run_worker():
 
                 signals = fetch_today_signals()
 
-                # 🔥 COLD START WITH PROGRESS
-                if not cold_start_done:
-                    send_message("⏪ Cold start replay started…")
-
-                    total = len(signals)
-                    processed = 0
-                    detected = 0
-                    cold_start_last_progress_ts = time.time()
-
-                    for s in signals:
-                        events = await replay_symbol(session, s["symbol"], s)
-                        cold_start_events.extend(events)
-
-                        processed += 1
-                        detected += len(events)
-
-                        now_ts = time.time()
-                        if (
-                            processed % COLD_PROGRESS_EVERY_SYMBOLS == 0
-                            or now_ts - cold_start_last_progress_ts >= COLD_PROGRESS_EVERY_SECONDS
-                        ):
-                            send_message(
-                                "⏳ *Cold start in progress…*\n\n"
-                                f"Processed : {processed} / {total}\n"
-                                f"Events    : {detected}\n"
-                                f"Time      : {now_str()}"
-                            )
-                            cold_start_last_progress_ts = now_ts
-
-                    send_message(
-                        "✅ *Cold start replay completed*\n\n"
-                        f"Total symbols : {total}\n"
-                        f"Total events  : {detected}\n"
-                        f"Completed at  : {now_str()}"
-                    )
-
-                    send_cold_start_summary(cold_start_events)
-                    cold_start_done = True
+                # 🔥 Start cold start ONCE in background
+                if not cold_start_task_started:
+                    asyncio.create_task(cold_start_task(session, signals))
+                    cold_start_task_started = True
 
                 maybe_send_summary()
 
@@ -333,7 +371,7 @@ async def run_worker():
 
                     ltp = candle[4]
 
-                    # BUY
+                    # BUY (UNCHANGED)
                     buy = trade_state.get(sym)
                     if buy:
                         s = buy["signal"]
@@ -367,7 +405,7 @@ async def run_worker():
                                     "Exit LTP": ltp,
                                 })
 
-                    # SELL
+                    # SELL (UNCHANGED)
                     sell = sell_state.get(sym)
                     if sell and is_sell_time():
 
@@ -394,8 +432,17 @@ async def run_worker():
                                     "Exit LTP": ltp,
                                 })
 
+                # 🔍 Periodic fetch stats log
+                log(
+                    f"Fetch stats | "
+                    f"Success={fetch_stats['success']} "
+                    f"Empty={fetch_stats['empty']} "
+                    f"Failed={fetch_stats['failed']}"
+                )
+
                 await asyncio.sleep(SLEEP_INTERVAL)
 
             except Exception as e:
-                send_message(f"⚠️ Worker error:\n{e}")
+                safe_send_message(f"⚠️ Worker error:\n{e}")
+                log(f"Worker exception: {e}")
                 await asyncio.sleep(ERROR_SLEEP)
