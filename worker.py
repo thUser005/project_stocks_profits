@@ -16,6 +16,8 @@ SLEEP_INTERVAL = 20
 ERROR_SLEEP = 15
 MAX_RETRIES = 3
 
+SUMMARY_INTERVAL = 600  # ⏱ 10 minutes (in seconds)
+
 IST = timezone(timedelta(hours=5, minutes=30))
 RESET_TIME = dtime(9, 15)
 
@@ -26,15 +28,25 @@ companies = load_companies()
 alerted = set()
 last_reset_date = None
 
+# 📊 STATS
+stats = {
+    "entered": 0,
+    "exited": 0,
+    "target_hit": 0,
+    "sl_hit": 0,
+}
+
+last_summary_ts = 0
+
 
 # =====================================================
 # HELPERS
 # =====================================================
 def maybe_reset_alerts():
     """
-    Reset alerted symbols once per trading day (after RESET_TIME)
+    Reset alerted symbols + stats once per trading day
     """
-    global alerted, last_reset_date
+    global alerted, last_reset_date, stats, last_summary_ts
 
     now = datetime.now(IST)
     today = now.date()
@@ -43,7 +55,39 @@ def maybe_reset_alerts():
         if last_reset_date != today:
             alerted.clear()
             last_reset_date = today
-            send_message("🔄 Alert state reset for new trading day")
+            last_summary_ts = 0
+
+            stats = {
+                "entered": 0,
+                "exited": 0,
+                "target_hit": 0,
+                "sl_hit": 0,
+            }
+
+            send_message("🔄 Alert & stats reset for new trading day")
+
+
+def maybe_send_summary():
+    """
+    Send Telegram summary every 10 minutes
+    """
+    global last_summary_ts
+
+    now_ts = datetime.now(IST).timestamp()
+
+    if now_ts - last_summary_ts < SUMMARY_INTERVAL:
+        return
+
+    last_summary_ts = now_ts
+
+    send_message(
+        "📊 *Trade Summary (10 min)*\n\n"
+        f"🟢 Entered: {stats['entered']}\n"
+        f"🎯 Target Hit: {stats['target_hit']}\n"
+        f"🛑 SL Hit: {stats['sl_hit']}\n"
+        f"🚪 Exited: {stats['exited']}\n\n"
+        f"⏰ Time: {datetime.now(IST).strftime('%H:%M IST')}"
+    )
 
 
 async def fetch_latest_safe(semaphore, session, symbol):
@@ -75,14 +119,19 @@ async def run_worker():
 
         while True:
             try:
-                # Market hours guard
+                # -------------------------------
+                # Market guard
+                # -------------------------------
                 if not is_market_time():
                     await asyncio.sleep(60)
                     continue
 
                 maybe_reset_alerts()
+                maybe_send_summary()
 
+                # -------------------------------
                 # Fetch signals
+                # -------------------------------
                 signals = fetch_today_signals()
                 if not signals:
                     await asyncio.sleep(SLEEP_INTERVAL)
@@ -122,6 +171,7 @@ async def run_worker():
                     if ltp is None:
                         continue
 
+                    # 🔔 ENTRY
                     if ltp >= s["open"]:
                         meta = companies[sym]
 
@@ -137,6 +187,7 @@ async def run_worker():
                         )
 
                         alerted.add(sym)
+                        stats["entered"] += 1
 
                 await asyncio.sleep(SLEEP_INTERVAL)
 
