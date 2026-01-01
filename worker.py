@@ -77,20 +77,34 @@ def safe_send_message(text=None, photo=None, caption=None):
             send_message(photo=photo, caption=caption)
         else:
             send_message(text=text)
-        time.sleep(0.4)  # ⛔ Telegram rate-limit protection
+        time.sleep(0.4)
     except Exception as e:
         log(f"TELEGRAM_SEND_FAILED :: {e}")
 
 # =====================================================
-# SUMMARY PIE IMAGE
+# SUMMARY PIE IMAGE (COUNT + %)
 # =====================================================
 def send_summary_pie(target, sl, entered, not_entered):
-    labels = ["Target Hit", "SL Hit", "Entered", "Not Entered"]
-    values = [target, sl, entered, not_entered]
+    labels_raw = [
+        ("Target Hit", target),
+        ("SL Hit", sl),
+        ("Entered", entered),
+        ("Not Entered", not_entered),
+    ]
+
+    total = sum(v for _, v in labels_raw) or 1
+
+    labels = [
+        f"{name}: {count} ({count/total*100:.1f}%)"
+        for name, count in labels_raw
+    ]
+
+    values = [count for _, count in labels_raw]
+
     colors = ["#2ecc71", "#e74c3c", "#f1c40f", "#95a5a6"]
 
     fig, ax = plt.subplots(figsize=(6, 6))
-    ax.pie(values, labels=labels, autopct="%1.1f%%", colors=colors)
+    ax.pie(values, labels=labels, colors=colors, startangle=140)
     ax.set_title("Cold Start Trade Distribution")
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
@@ -105,7 +119,32 @@ def send_summary_pie(target, sl, entered, not_entered):
     os.unlink(tmp.name)
 
 # =====================================================
-# TABLE IMAGE (PAGINATED)
+# META SUMMARY TEXT (NEW)
+# =====================================================
+def send_meta_summary_text(meta):
+    if not meta:
+        return
+
+    summary = meta.get("summary", {})
+
+    msg = (
+        "📌 *Strategy Meta Summary*\n\n"
+        f"📈 Breakout %: {meta.get('breakout_pct')}\n"
+        f"🎯 Profit %: {meta.get('profit_pct')}\n"
+        f"⏰ Entry After: {meta.get('entry_after')}\n"
+        f"⚡ API Time: {meta.get('response_time_ms')} ms\n\n"
+        "📊 *Counts*\n"
+        f"• Entered: {summary.get('entered', 0)}\n"
+        f"• Target Hit: {summary.get('target_hit', 0)}\n"
+        f"• SL Hit: {summary.get('stoploss_hit', 0)}\n"
+        f"• Market Closed: {summary.get('market_closed', 0)}\n"
+        f"• Not Entered: {summary.get('not_entered', 0)}\n"
+    )
+
+    safe_send_message(text=msg)
+
+# =====================================================
+# TABLE IMAGE (UNCHANGED)
 # =====================================================
 def send_table_images(title, bucket):
     if not bucket:
@@ -136,23 +175,14 @@ def send_table_images(title, bucket):
         except:
             font = font_b = ImageFont.load_default()
 
-        draw.text(
-            (pad, 5),
-            f"{title} (Page {page+1}/{total_pages})",
-            font=font_b,
-            fill="black",
-        )
+        draw.text((pad, 5), f"{title} (Page {page+1}/{total_pages})", font=font_b)
 
         y = pad + 30
         x = pad
 
         for i, h in enumerate(col_headers):
-            draw.rectangle(
-                [x, y, x + col_widths[i], y + header_h],
-                fill="#eeeeee",
-                outline="black",
-            )
-            draw.text((x + 6, y + 12), h, font=font_b, fill="black")
+            draw.rectangle([x, y, x + col_widths[i], y + header_h], fill="#eeeeee", outline="black")
+            draw.text((x + 6, y + 12), h, font=font_b)
             x += col_widths[i]
 
         y += header_h
@@ -162,7 +192,6 @@ def send_table_images(title, bucket):
             pnl_color = "#2ecc71" if pnl > 0 else "#e74c3c" if pnl < 0 else "#7f8c8d"
 
             x = pad
-
             draw.rectangle([x, y, x + col_widths[0], y + row_h], outline="black")
             draw.ellipse([x+20, y+10, x+40, y+30], fill="#3498db")
             x += col_widths[0]
@@ -176,16 +205,8 @@ def send_table_images(title, bucket):
             ]
 
             for i, cell in enumerate(cells):
-                draw.rectangle(
-                    [x, y, x + col_widths[i+1], y + row_h],
-                    outline="black",
-                )
-                draw.text(
-                    (x + 6, y + 10),
-                    cell,
-                    font=font,
-                    fill=pnl_color if i == 4 else "black",
-                )
+                draw.rectangle([x, y, x + col_widths[i+1], y + row_h], outline="black")
+                draw.text((x + 6, y + 10), cell, fill=pnl_color if i == 4 else "black")
                 x += col_widths[i+1]
 
             y += row_h
@@ -193,21 +214,18 @@ def send_table_images(title, bucket):
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
         img.save(tmp.name)
 
-        safe_send_message(
-            photo=tmp.name,
-            caption=f"📉 {title}\n⏱ {now_str()}",
-        )
-
+        safe_send_message(photo=tmp.name, caption=f"📉 {title}\n⏱ {now_str()}")
         os.unlink(tmp.name)
 
 # =====================================================
-# ANALYZED API MERGE
+# ANALYZED API MERGE (META PRESERVED)
 # =====================================================
 def trade_uid(obj):
     return f"{obj['symbol']}|{obj['entry_time']}|{obj['exit_time']}"
 
 def fetch_and_merge_analyzed():
     merged = {}
+    meta = None
 
     for url in ANALYZED_APIS:
         r = requests.get(
@@ -220,6 +238,7 @@ def fetch_and_merge_analyzed():
         )
 
         payload = r.json()
+        meta = meta or payload  # keep first meta
 
         for group, buckets in payload.get("the_data", {}).items():
             merged.setdefault(group, {})
@@ -229,7 +248,7 @@ def fetch_and_merge_analyzed():
                     if isinstance(obj, dict) and "entry_time" in obj:
                         merged[group][bucket][trade_uid(obj)] = obj
 
-    return merged
+    return merged, meta
 
 # =====================================================
 # COLD START
@@ -237,11 +256,13 @@ def fetch_and_merge_analyzed():
 def run_cold_start_from_api():
     global cold_start_done
 
-    data = fetch_and_merge_analyzed()
+    data, meta = fetch_and_merge_analyzed()
 
     exited = data.get("1_exited", {})
     entered = data.get("2_entered", {})
     not_entered = data.get("3_not_entered", {})
+
+    send_meta_summary_text(meta)
 
     send_summary_pie(
         target=len(exited.get("1_profit", {})),
@@ -253,13 +274,12 @@ def run_cold_start_from_api():
     send_table_images("TARGET HIT", exited.get("1_profit", {}))
     send_table_images("STOPLOSS HIT", exited.get("2_stoploss", {}))
     send_table_images("ENTERED", entered)
-    # send_table_images("NOT ENTERED", not_entered)
 
     cold_start_done = True
     log("COLD_START_DONE")
 
 # =====================================================
-# WORKER
+# WORKER (UNCHANGED)
 # =====================================================
 async def run_worker():
     global cold_start_task_started
@@ -278,9 +298,7 @@ async def run_worker():
                     continue
 
                 if not cold_start_task_started:
-                    asyncio.get_running_loop().run_in_executor(
-                        None, run_cold_start_from_api
-                    )
+                    asyncio.get_running_loop().run_in_executor(None, run_cold_start_from_api)
                     cold_start_task_started = True
 
                 await asyncio.sleep(SLEEP_INTERVAL)
