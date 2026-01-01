@@ -19,7 +19,6 @@ HEADERS = {
 MARKET_OPEN = time(9, 15)
 MARKET_CLOSE = time(15, 30)
 
-
 # =====================================================
 # INTERNAL HELPER
 # =====================================================
@@ -46,19 +45,15 @@ async def _fetch_candles(
     except Exception:
         return []
 
-
 # =====================================================
-# 1️⃣ FULL MARKET DAY CANDLES (FOR A DATE)
+# 1️⃣ FULL MARKET DAY CANDLES
 # =====================================================
 async def fetch_full_day_candles(
     session,
     symbol,
-    date_str,          # YYYY-MM-DD
+    date_str,
     interval=3,
 ):
-    """
-    Fetch candles from 09:15 → 15:30 IST for a given date
-    """
     d = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=IST)
 
     start_dt = datetime.combine(d.date(), MARKET_OPEN, tzinfo=IST)
@@ -72,9 +67,8 @@ async def fetch_full_day_candles(
         interval,
     )
 
-
 # =====================================================
-# 2️⃣ LAST N MINUTES CANDLES (LIVE / TEST)
+# 2️⃣ LAST N MINUTES CANDLES
 # =====================================================
 async def fetch_last_n_minutes_candles(
     session,
@@ -82,9 +76,6 @@ async def fetch_last_n_minutes_candles(
     minutes=5,
     interval=3,
 ):
-    """
-    Fetch candles for last N minutes (e.g. 5 / 10)
-    """
     end_dt = datetime.now(IST)
     start_dt = end_dt - timedelta(minutes=minutes)
 
@@ -96,18 +87,14 @@ async def fetch_last_n_minutes_candles(
         interval,
     )
 
-
 # =====================================================
-# 3️⃣ LATEST CANDLE ONLY (DERIVED)
+# 3️⃣ LATEST CANDLE ONLY
 # =====================================================
 async def fetch_latest_candle(
     session,
     symbol,
     interval=3,
 ):
-    """
-    Fetch ONLY the latest candle (last interval)
-    """
     _, candles = await fetch_last_n_minutes_candles(
         session,
         symbol,
@@ -116,3 +103,21 @@ async def fetch_latest_candle(
     )
 
     return symbol, candles[-1] if candles else None
+
+# =====================================================
+# 4️⃣ GENERIC RANGE FETCH (FIX)
+# =====================================================
+async def fetch_candles_for_range(
+    session,
+    symbol,
+    start_ms,
+    end_ms,
+    interval=3,
+):
+    return symbol, await _fetch_candles(
+        session,
+        symbol,
+        start_ms,
+        end_ms,
+        interval,
+    )
