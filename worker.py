@@ -12,7 +12,7 @@ from time_utils import is_market_time
 # CONFIG
 # =====================================================
 CONCURRENCY = 100
-SLEEP_INTERVAL = 1
+SLEEP_INTERVAL = 0
 ERROR_SLEEP = 15
 MAX_RETRIES = 3
 
