@@ -313,12 +313,9 @@ def fetch_and_merge_analyzed():
 def run_cold_start_from_api():
     global cold_start_done
 
-    # 🚫 MARKET CLOSED CHECK
+    # ✅ Inform market status (but DO NOT exit)
     if not is_market_time():
-        send_market_closed_notice(context="Cold Start Summary")
-        cold_start_done = True
-        log("COLD_START_SKIPPED_MARKET_CLOSED")
-        return
+        send_market_closed_notice(context="Cold Start Summary (Historical Data)")
 
     data, meta = fetch_and_merge_analyzed()
 
@@ -326,6 +323,7 @@ def run_cold_start_from_api():
     entered = data.get("2_entered", {})
     not_entered = data.get("3_not_entered", {})
 
+    # ✅ Always send historical summary
     send_meta_summary_text(meta)
 
     send_summary_pie(
@@ -340,7 +338,8 @@ def run_cold_start_from_api():
     send_table_images("ENTERED", entered)
 
     cold_start_done = True
-    log("COLD_START_DONE")
+    log("COLD_START_DONE (HISTORICAL)")
+
 
 # =====================================================
 # LIVE TRADE WORKER (NEW – ADDITIVE ONLY)
