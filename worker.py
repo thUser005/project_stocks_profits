@@ -89,6 +89,14 @@ def safe_send_message(text=None, photo=None, caption=None):
         time.sleep(0.4)
     except Exception as e:
         log(f"TELEGRAM_SEND_FAILED :: {e}")
+def send_market_closed_notice(context="Summary"):
+    msg = (
+        f"⛔ *Market Closed*\n\n"
+        f"Context: {context}\n"
+        f"Time: {now_str()}\n"
+        f"No summary images sent."
+    )
+    safe_send_message(text=msg)
 
 # =====================================================
 # HELPERS (FORMAT ONLY)
@@ -305,6 +313,13 @@ def fetch_and_merge_analyzed():
 def run_cold_start_from_api():
     global cold_start_done
 
+    # 🚫 MARKET CLOSED CHECK
+    if not is_market_time():
+        send_market_closed_notice(context="Cold Start Summary")
+        cold_start_done = True
+        log("COLD_START_SKIPPED_MARKET_CLOSED")
+        return
+
     data, meta = fetch_and_merge_analyzed()
 
     exited = data.get("1_exited", {})
@@ -312,6 +327,7 @@ def run_cold_start_from_api():
     not_entered = data.get("3_not_entered", {})
 
     send_meta_summary_text(meta)
+
     send_summary_pie(
         target=len(exited.get("1_profit", {})),
         sl=len(exited.get("2_stoploss", {})),
