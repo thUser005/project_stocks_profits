@@ -33,10 +33,10 @@ def send_message(text):
 # =====================================================
 # CONFIG
 # =====================================================
-CONCURRENCY = 50
+CONCURRENCY = 100
 MAX_RETRIES = 3
 ERROR_SLEEP = 15
-SLEEP_INTERVAL = 5
+SLEEP_INTERVAL = 1
 SUMMARY_INTERVAL = 600
 
 IST = timezone(timedelta(hours=5, minutes=30))
