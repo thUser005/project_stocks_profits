@@ -25,7 +25,7 @@ ERROR_SLEEP = 15
 MAX_RETRIES = 3
 SUMMARY_INTERVAL = 600
 
-ROWS_PER_IMAGE = 30
+ROWS_PER_IMAGE = 100
 
 IST = timezone(timedelta(hours=5, minutes=30))
 RESET_TIME = dtime(9, 15)
