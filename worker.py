@@ -29,7 +29,10 @@ BUY_END   = dtime(11, 30)
 SELL_START = dtime(10, 0)
 SELL_END   = dtime(15, 30)
 
-ANALYZED_API = "https://g1-stock.vercel.app/api/analyze-signals"
+ANALYZED_APIS = [
+    "https://g1-stock.vercel.app/api/analyze-signals",
+    "https://g2-stock.vercel.app/api/analyze-signals",
+]
 
 # =====================================================
 # STATE
@@ -135,19 +138,24 @@ async def fetch_latest_safe(semaphore, session, symbol):
         return symbol, None
 
 # =====================================================
-# 🔥 API-BASED COLD START
+# 🔥 ANALYZED API MERGE
 # =====================================================
-def run_cold_start_from_api():
-    global cold_start_done
+def fetch_and_merge_analyzed():
+    now = datetime.now(IST)
 
-    log("Cold start (API) started")
-    safe_send_message("⏪ Cold start summary loading…")
+    merged_summary = {
+        "entered": 0,
+        "target_hit": 0,
+        "stoploss_hit": 0,
+        "not_entered": 0,
+        "market_closed": 0,
+    }
 
-    try:
-        now = datetime.now(IST)
+    merged_data = {}
 
+    for url in ANALYZED_APIS:
         r = requests.get(
-            ANALYZED_API,
+            url,
             params={
                 "date": now.strftime("%Y-%m-%d"),
                 "end_before": now.strftime("%H:%M"),
@@ -155,30 +163,74 @@ def run_cold_start_from_api():
             timeout=30,
         )
         r.raise_for_status()
-        data = r.json()
+        payload = r.json()
 
+        # ---- summary merge ----
+        s = payload.get("summary", {})
+        for k in merged_summary:
+            merged_summary[k] += s.get(k, 0)
+
+        # ---- data merge ----
+        for group, buckets in payload.get("the_data", {}).items():
+            merged_data.setdefault(group, {})
+            for bucket, symbols in buckets.items():
+                merged_data[group].setdefault(bucket, {})
+                merged_data[group][bucket].update(symbols)
+
+    return merged_summary, merged_data
+
+# =====================================================
+# 🔥 API-BASED COLD START (MERGED)
+# =====================================================
+def run_cold_start_from_api():
+    global cold_start_done
+
+    log("Cold start started")
+    safe_send_message("⏪ Cold start summary loading…")
+
+    try:
+        summary, data = fetch_and_merge_analyzed()
     except Exception as e:
         safe_send_message(f"❌ Cold start API failed:\n{e}")
         log(f"Cold start API error: {e}")
         cold_start_done = True
         return
 
-    events = []
+    # -------- SUMMARY --------
+    safe_send_message(
+        "📊 *COLD START SUMMARY*\n\n"
+        f"🟢 Entered      : {summary['entered']}\n"
+        f"🎯 Target Hit   : {summary['target_hit']}\n"
+        f"🛑 SL Hit       : {summary['stoploss_hit']}\n"
+        f"🚪 Not Entered  : {summary['not_entered']}\n"
+        f"🏁 Market Closed: {summary['market_closed']}\n\n"
+        f"⏰ Till: {now_str()}"
+    )
 
-    for obj in data.get("groups", {}).get("exited", []):
-        events.append(
-            f"{obj['symbol']}\n"
-            f"Status : {obj['status']}\n"
-            f"PnL    : {obj.get('pnl', 0)}\n"
-        )
+    # -------- DETAILED EXITS --------
+    exited = data.get("1_exited", {})
 
-    if not events:
-        safe_send_message("ℹ️ No trades completed before server start")
-    else:
-        safe_send_message("📊 *COLD START SUMMARY*\n\n" + "\n".join(events))
+    def send_exit_block(title, bucket):
+        if not bucket:
+            return
+
+        blocks = []
+        for sym, obj in bucket.items():
+            blocks.append(
+                f"*{sym}*\n"
+                f"Entry : {obj['entry']} @ {obj['entry_time']}\n"
+                f"Exit  : {obj['exit_ltp']} @ {obj['exit_time']}\n"
+                f"Qty   : {obj['qty']}\n"
+                f"PnL   : ₹{round(obj.get('pnl', 0), 2)}\n"
+            )
+
+        safe_send_message(f"📉 *{title}*\n\n" + "\n".join(blocks))
+
+    send_exit_block("TARGET HIT", exited.get("1_profit", {}))
+    send_exit_block("STOPLOSS HIT", exited.get("2_stoploss", {}))
 
     cold_start_done = True
-    log("Cold start (API) completed")
+    log("Cold start completed")
 
 # =====================================================
 # WORKER
@@ -230,7 +282,6 @@ async def run_worker():
 
                     ltp = candle[4]
                     buy = trade_state.get(sym)
-
                     if not buy:
                         continue
 
