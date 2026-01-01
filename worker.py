@@ -1,6 +1,6 @@
 import asyncio
 import aiohttp
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dtime
 
 from companies import load_companies
 from signals_api import fetch_today_signals
@@ -11,13 +11,13 @@ from time_utils import is_market_time
 # =====================================================
 # CONFIG
 # =====================================================
-CONCURRENCY = 15        # ⛔ DO NOT exceed Groww limits
+CONCURRENCY = 15
 SLEEP_INTERVAL = 20
 ERROR_SLEEP = 15
 MAX_RETRIES = 3
 
 IST = timezone(timedelta(hours=5, minutes=30))
-RESET_TIME = (9, 15)
+RESET_TIME = dtime(9, 15)
 
 # =====================================================
 # STATE
@@ -32,14 +32,14 @@ last_reset_date = None
 # =====================================================
 def maybe_reset_alerts():
     """
-    Reset alerted symbols once per trading day (after 09:15 IST)
+    Reset alerted symbols once per trading day (after RESET_TIME)
     """
     global alerted, last_reset_date
 
     now = datetime.now(IST)
     today = now.date()
 
-    if now.time() >= datetime.strptime("09:15", "%H:%M").time():
+    if now.time() >= RESET_TIME:
         if last_reset_date != today:
             alerted.clear()
             last_reset_date = today
@@ -47,16 +47,13 @@ def maybe_reset_alerts():
 
 
 async def fetch_latest_safe(semaphore, session, symbol):
-    """
-    Fetch latest candle with retry + concurrency guard
-    """
     async with semaphore:
-        for attempt in range(1, MAX_RETRIES + 1):
+        for attempt in range(MAX_RETRIES):
             try:
                 candle = await fetch_latest_candle(session, symbol)
                 return symbol, candle
             except Exception:
-                if attempt == MAX_RETRIES:
+                if attempt == MAX_RETRIES - 1:
                     return symbol, None
                 await asyncio.sleep(1)
 
@@ -69,6 +66,8 @@ async def run_worker():
     connector = aiohttp.TCPConnector(limit=CONCURRENCY)
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
+    send_message("🟢 Worker started")
+
     async with aiohttp.ClientSession(
         timeout=timeout,
         connector=connector,
@@ -76,34 +75,25 @@ async def run_worker():
 
         while True:
             try:
-                # -------------------------------
                 # Market hours guard
-                # -------------------------------
                 if not is_market_time():
                     await asyncio.sleep(60)
                     continue
 
                 maybe_reset_alerts()
 
-                # -------------------------------
-                # Fetch signals (source of truth)
-                # -------------------------------
+                # Fetch signals
                 signals = fetch_today_signals()
                 if not signals:
                     await asyncio.sleep(SLEEP_INTERVAL)
                     continue
 
-                # -------------------------------
-                # Filter symbols
-                # -------------------------------
                 symbols = []
                 signal_map = {}
 
                 for s in signals:
-                    sym = s["symbol"]
-                    if sym not in companies:
-                        continue
-                    if sym in alerted:
+                    sym = s.get("symbol")
+                    if not sym or sym not in companies or sym in alerted:
                         continue
 
                     symbols.append(sym)
@@ -113,9 +103,6 @@ async def run_worker():
                     await asyncio.sleep(SLEEP_INTERVAL)
                     continue
 
-                # -------------------------------
-                # 🔥 FIRE ALL REQUESTS AT ONCE
-                # -------------------------------
                 tasks = [
                     fetch_latest_safe(semaphore, session, sym)
                     for sym in symbols
@@ -123,42 +110,32 @@ async def run_worker():
 
                 results = await asyncio.gather(*tasks)
 
-                # -------------------------------
-                # Process results
-                # -------------------------------
                 for sym, candle in results:
-                    if not candle:
-                        continue
-                    if sym in alerted:
+                    if not candle or len(candle) < 5 or sym in alerted:
                         continue
 
                     s = signal_map.get(sym)
                     if not s:
                         continue
 
-                    open_price = s["open"]
-                    entry = s["entry"]
-                    target = s["target"]
-                    sl = s["stoploss"]
-
                     ltp = candle[4]
+                    if ltp is None:
+                        continue
 
-                    # 🔔 TRIGGER CONDITION
-                    if ltp >= open_price:
+                    if ltp >= s["open"]:
                         meta = companies[sym]
 
-                        msg = (
+                        send_message(
                             f"📢 STOCK TRIGGERED\n\n"
                             f"Company: {meta['company']}\n"
                             f"Symbol: {sym}\n\n"
-                            f"Open: {open_price}\n"
+                            f"Open: {s['open']}\n"
                             f"LTP: {ltp}\n"
-                            f"Entry: {entry}\n"
-                            f"Target: {target}\n"
-                            f"SL: {sl}"
+                            f"Entry: {s['entry']}\n"
+                            f"Target: {s['target']}\n"
+                            f"SL: {s['stoploss']}"
                         )
 
-                        send_message(msg)
                         alerted.add(sym)
 
                 await asyncio.sleep(SLEEP_INTERVAL)

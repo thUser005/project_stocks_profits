@@ -5,7 +5,6 @@ import threading
 import subprocess
 import re
 import time
-import shutil
 import urllib.request
 from flask import Flask, jsonify, request
 from flask_compress import Compress
@@ -27,10 +26,11 @@ for p in ["flask", "flask-compress", "requests", "aiohttp"]:
     ensure_package(p)
 
 # =====================================================
-# IMPORT AFTER INSTALL
+# IMPORTS
 # =====================================================
 from test_runner import run_test_for_date
-from telegram_msg import send_message   # ✅ ADD THIS
+from worker import run_worker
+from telegram_msg import send_message
 
 # =====================================================
 # FLASK APP
@@ -41,7 +41,10 @@ Compress(app)
 
 @app.route("/")
 def health():
-    return jsonify({"status": "running"})
+    return jsonify({
+        "status": "running",
+        "worker": "enabled"
+    })
 
 
 @app.route("/test/candles", methods=["GET"])
@@ -54,13 +57,25 @@ def test_candles():
     if not date:
         return jsonify({"error": "date=YYYY-MM-DD required"}), 400
 
-    try:
-        result = asyncio.run(run_test_for_date(date))
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-        result = loop.run_until_complete(run_test_for_date(date))
-
+    # isolated loop per request (SAFE)
+    result = asyncio.run(run_test_for_date(date))
     return jsonify(result)
+
+
+# =====================================================
+# WORKER THREAD (ASYNC LOOP)
+# =====================================================
+def start_worker():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    send_message("🟢 Worker started successfully")
+
+    try:
+        loop.run_until_complete(run_worker())
+    except Exception as e:
+        send_message(f"🔴 Worker crashed:\n{e}")
+        raise
 
 
 # =====================================================
@@ -103,29 +118,24 @@ def start_cloudflare_tunnel(port):
         if match:
             public_url = match.group(0)
 
+            test_url = f"{public_url}/test/candles?date=2025-12-31"
+
             print("\n✅ PUBLIC URL:")
             print(public_url)
 
-            test_url = f"{public_url}/test/candles?date=2025-12-31"
-
-            print(f"\n🧪 TEST:\n{test_url}\n")
-
-            # =====================================================
-            # 📩 TELEGRAM NOTIFICATION (SERVER READY)
-            # =====================================================
             send_message(
-                "🚀 *Candle Test Server Started*\n\n"
+                "🚀 *Dedicated Worker Server Started*\n\n"
                 f"🌐 URL: {public_url}\n"
                 f"❤️ Health: {public_url}/\n"
                 f"🧪 Test: {test_url}\n\n"
-                "✅ Server is live and ready"
+                "✅ API + Worker + Tunnel are LIVE"
             )
 
             break
 
 
 # =====================================================
-# FLASK SERVER THREAD
+# FLASK THREAD
 # =====================================================
 def start_flask():
     app.run(
@@ -141,14 +151,36 @@ def start_flask():
 # MAIN
 # =====================================================
 def main():
-    print("🚀 Starting Flask server...")
-    threading.Thread(target=start_flask, daemon=True).start()
+    print("🚀 Starting Dedicated Server...")
 
-    time.sleep(2)  # give Flask time to bind
+    # -------------------------------
+    # Start Flask
+    # -------------------------------
+    threading.Thread(
+        target=start_flask,
+        daemon=True
+    ).start()
 
+    time.sleep(2)
+
+    # -------------------------------
+    # Start Worker
+    # -------------------------------
+    threading.Thread(
+        target=start_worker,
+        daemon=True
+    ).start()
+
+    time.sleep(2)
+
+    # -------------------------------
+    # Start Cloudflare Tunnel
+    # -------------------------------
     start_cloudflare_tunnel(5000)
 
-    # Keep process alive
+    # -------------------------------
+    # Keep alive
+    # -------------------------------
     while True:
         time.sleep(60)
 
