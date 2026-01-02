@@ -1,4 +1,5 @@
 import aiohttp
+import time as _time
 from datetime import datetime, timedelta, time, timezone
 
 # =====================================================
@@ -18,6 +19,18 @@ HEADERS = {
 
 MARKET_OPEN = time(9, 15)
 MARKET_CLOSE = time(15, 30)
+
+# =====================================================
+# LOGGING
+# =====================================================
+def log(msg: str):
+    ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    print(f"[{ts}] {msg}", flush=True)
+
+# throttle candle logs per symbol
+_LAST_CANDLE_LOG_TS = {}
+
+LOG_INTERVAL_SECONDS = 10  # log once per symbol per 10s
 
 # =====================================================
 # INTERNAL HELPER (LOW LEVEL)
@@ -41,8 +54,23 @@ async def _fetch_candles(
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             data = await resp.json()
-            return data.get("candles", []) or []
-    except Exception:
+            candles = data.get("candles", []) or []
+
+            # ---------- SERVER LOG (THROTTLED) ----------
+            now_ts = _time.time()
+            last_ts = _LAST_CANDLE_LOG_TS.get(symbol, 0)
+
+            if now_ts - last_ts >= LOG_INTERVAL_SECONDS:
+                log(
+                    f"CANDLES_FETCHED :: "
+                    f"{symbol} | interval={interval}m | candles={len(candles)}"
+                )
+                _LAST_CANDLE_LOG_TS[symbol] = now_ts
+
+            return candles
+
+    except Exception as e:
+        log(f"CANDLES_FETCH_FAILED :: {symbol} | {e}")
         return []
 
 # =====================================================
@@ -59,13 +87,15 @@ async def fetch_full_day_candles(
     start_dt = datetime.combine(d.date(), MARKET_OPEN, tzinfo=IST)
     end_dt = datetime.combine(d.date(), MARKET_CLOSE, tzinfo=IST)
 
-    return symbol, await _fetch_candles(
+    candles = await _fetch_candles(
         session,
         symbol,
         int(start_dt.timestamp() * 1000),
         int(end_dt.timestamp() * 1000),
         interval,
     )
+
+    return symbol, candles
 
 # =====================================================
 # 2️⃣ LAST N MINUTES CANDLES
@@ -79,13 +109,15 @@ async def fetch_last_n_minutes_candles(
     end_dt = datetime.now(IST)
     start_dt = end_dt - timedelta(minutes=minutes)
 
-    return symbol, await _fetch_candles(
+    candles = await _fetch_candles(
         session,
         symbol,
         int(start_dt.timestamp() * 1000),
         int(end_dt.timestamp() * 1000),
         interval,
     )
+
+    return symbol, candles
 
 # =====================================================
 # 3️⃣ LATEST CANDLE ONLY
@@ -102,7 +134,12 @@ async def fetch_latest_candle(
         interval=interval,
     )
 
-    return symbol, candles[-1] if candles else None
+    latest = candles[-1] if candles else None
+
+    if latest is None:
+        log(f"LATEST_CANDLE_EMPTY :: {symbol}")
+
+    return symbol, latest
 
 # =====================================================
 # 4️⃣ GENERIC RANGE FETCH (RAW TIMESTAMP)
@@ -114,13 +151,15 @@ async def fetch_candles_for_range(
     end_ms,
     interval=3,
 ):
-    return symbol, await _fetch_candles(
+    candles = await _fetch_candles(
         session,
         symbol,
         start_ms,
         end_ms,
         interval,
     )
+
+    return symbol, candles
 
 # =====================================================
 # 5️⃣ INTRADAY TIME-RANGE FETCH (🔥 REQUIRED FOR SELL LOGIC)
@@ -143,10 +182,12 @@ async def fetch_intraday_candles(
     start_dt = datetime.combine(today, start_time, tzinfo=IST)
     end_dt = datetime.combine(today, end_time, tzinfo=IST)
 
-    return symbol, await _fetch_candles(
+    candles = await _fetch_candles(
         session,
         symbol,
         int(start_dt.timestamp() * 1000),
         int(end_dt.timestamp() * 1000),
         interval,
     )
+
+    return symbol, candles
