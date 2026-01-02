@@ -32,7 +32,7 @@ RESET_TIME = dtime(9, 15)
 
 BUY_START = dtime(9, 30)
 BUY_END   = dtime(11, 30)
-
+ 
 SELL_START = dtime(10, 0)
 SELL_END   = dtime(15, 30)
 
@@ -344,10 +344,16 @@ async def run_live_trade_worker():
                 symbols = list(symbol_signal_map.keys())
                 tasks = [fetch_latest_candle(session, s) for s in symbols]
                 candles = await asyncio.gather(*tasks, return_exceptions=True)
+                interval_signals = len(symbols)
+                interval_candles_ok = 0
+                interval_buy_triggers = 0
 
                 for sym, candle in zip(symbols, candles):
                     if not candle or not isinstance(candle, list) or len(candle) < 5:
                         continue
+
+                    interval_candles_ok += 1
+
 
                     ltp = candle[4]
                     high = max(candle[:4])
@@ -363,10 +369,12 @@ async def run_live_trade_worker():
                         and sym not in live_alerted
                         and sym in day_highs
                         and ltp <= day_highs[sym] * 1.03
+                        
                     ):
                         entry = round(day_highs[sym] * 1.03, 2)
                         target = round(entry * 1.03, 2)
                         sl = round(entry * 0.99, 2)
+                        interval_buy_triggers += 1
 
                         live_trades[sym] = {"target": target, "sl": sl}
                         live_alerted.add(sym)
@@ -425,6 +433,13 @@ async def run_live_trade_worker():
                             stats["sl_hit"] += 1
                             safe_send_message(f"🛑 *SL HIT*: {sym} @ {ltp:.2f}")
                             del live_trades[sym]
+                log(
+                    f"LOOP_STATS :: "
+                    f"Signals={interval_signals} | "
+                    f"CandlesOK={interval_candles_ok} | "
+                    f"BuyTriggered={interval_buy_triggers} | "
+                    f"ActiveTrades={len(live_trades)}"
+                )
 
                 await asyncio.sleep(SLEEP_INTERVAL)
 

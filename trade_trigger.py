@@ -54,6 +54,7 @@ def trigger_gtt_trade(
                     f"{symbol_key}\n"
                     f"GTT ID: {gtt_id}\n"
                     f"Qty: {qty}"
+                    f"Response : {res}"
                 )
             )
             return gtt_id
