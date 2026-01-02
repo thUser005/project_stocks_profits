@@ -10,7 +10,12 @@ import socket
 import requests
 from flask import Flask, jsonify, request
 from flask_compress import Compress
+from dotenv import load_dotenv
 
+# ===============================
+# LOAD ENV
+# ===============================
+load_dotenv()
 # =====================================================
 # CONFIG
 # =====================================================
@@ -19,6 +24,14 @@ MAX_PORT_TRIES = 20
 PID_FILE = "/tmp/project_worker.pid"
 PORT_FILE = "/tmp/project_worker.port"
 CLOUDFLARED_BIN = "./cloudflared"
+
+# =====================================================
+# PLATFORM / MODE DETECTION
+# =====================================================
+WINDOWS_FLAG = (
+    os.getenv("WINDOWS_FLAG", "").lower() == "true"
+    or sys.platform.startswith("win")
+)
 
 # =====================================================
 # AUTO-INSTALL REQUIRED PYTHON PACKAGES
@@ -58,7 +71,7 @@ def pick_free_port(base: int) -> int:
     raise RuntimeError("❌ No free port available")
 
 # =====================================================
-# PID + SOFT STOP LOGIC (🔥 NEW)
+# PID + SOFT STOP LOGIC
 # =====================================================
 def acquire_pid_lock_with_prompt():
     if not os.path.exists(PID_FILE):
@@ -75,23 +88,21 @@ def acquire_pid_lock_with_prompt():
         old_port = int(f.read().strip())
 
     print(f"\n⚠️ App already running (PID {old_pid}, port {old_port})")
-    ans = 'yes'
+
+    # Auto-approve restart
+    ans = "yes"
 
     if ans != "yes":
         print("🚫 Keeping existing app. Exiting.")
         sys.exit(0)
 
-    # ---- Soft stop via HTTP ----
     try:
         print("🛑 Sending soft-stop request to old app...")
         requests.post(f"http://127.0.0.1:{old_port}/admin/stop", timeout=5)
         time.sleep(2)
-        print("🛑 Sending soft-stop request to old app...")
-        
     except Exception as e:
         print("⚠️ Failed to contact old app:", e)
 
-    # Cleanup
     if os.path.exists(PID_FILE):
         os.remove(PID_FILE)
     if os.path.exists(PORT_FILE):
@@ -120,7 +131,6 @@ def test_candles():
     return jsonify(asyncio.run(run_test_for_date(date)))
 
 
-# 🔥 SOFT STOP ENDPOINT
 @app.route("/admin/stop", methods=["POST"])
 def admin_stop():
     print("🛑 Soft stop requested")
@@ -149,7 +159,14 @@ def ensure_cloudflared():
 
 
 def start_cloudflare_tunnel(port):
+    if WINDOWS_FLAG:
+        print("🪟 WINDOWS MODE DETECTED")
+        print(f"🌐 Local server running at http://127.0.0.1:{port}")
+        return
+
+    print("☁️ CLOUD MODE DETECTED → Starting Cloudflare Tunnel")
     ensure_cloudflared()
+
     p = subprocess.Popen(
         [CLOUDFLARED_BIN, "tunnel", "--url", f"http://localhost:{port}"],
         stdout=subprocess.PIPE,

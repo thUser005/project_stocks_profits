@@ -1,8 +1,13 @@
 import os
 import requests
+from dotenv import load_dotenv
 
-BOT = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT = os.environ["TELEGRAM_CHAT_ID"]
+# ===============================
+# LOAD ENV
+# ===============================
+load_dotenv()
+BOT = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT = os.getenv("TELEGRAM_CHAT_ID")
 
 API = f"https://api.telegram.org/bot{BOT}"
 
